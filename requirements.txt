@@ -1,0 +1,12 @@
+wheel
+numpy
+pandas
+nibabel
+matplotlib
+nvidia-cudnn-cu11==8.6.0.163
+tensorflow==2.16.1
+keras
+tf-keras
+scikit-learn
+tensorrt
+antspynet
