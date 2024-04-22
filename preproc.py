@@ -52,6 +52,7 @@ class BaseT1CAE:
         self.T1_list = [line.replace('\n','') for line in open('ADNI_T1s.txt', 'r')]
         self.data_temp_dir = os.path.join(self.base_dir, 'temp_data')
         self.data_dir = os.path.join(self.base_dir, 'data')
+        self.atlas = os.path.join(self.base_dir, 'atlases', 'MNI152_T1_1mm_brain.nii.gz')
         self.paths = self.get_T1_brain_paths_from_FS()
         self.niftis = []
         # split train/test data
@@ -156,12 +157,21 @@ class PreprocDataset(BaseT1CAE):
         cmd = f'{resamp} -orient LPI -input {nii_temp} -prefix {nii_img} -overwrite'
         self.run_cmd(cmd, 'resample-t1')
     
+    def reg_to_template(self, img):
+        '''Register T1 to MNI atlas'''
+        in_img = os.path.join(self.data_temp_dir, img + '.nii.gz')
+        reg_img = os.path.join(self.data_dir, img + '.nii.gz')
+        cmd = f'{get_fsl_script_prefix()}' \
+              f'flirt -in {in_img} -ref {self.atlas} -dof 6 -out {reg_img}'  
+        self.run_cmd(cmd, 'reg-t1')
+    
     def run(self):
-        logger.info('Converting mgz images to nii format')
+        logger.info('Preprocessing images')
         for img in self.paths.keys():
-            logger.info('Converting image ' + img)
+            logger.info('Registering image ' + img + ' to MNI template')
             try:
-                self.mgz_to_nii(img)
+                #self.mgz_to_nii(img)
+                self.reg_to_template(img)
             except FailedScriptError:
                 continue
 
