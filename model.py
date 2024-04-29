@@ -31,10 +31,10 @@ class DataGenerator(Sequence):
         self.train_data_dir = os.path.join(self.input_data_dir, 'training')
         self.test_data_dir = os.path.join(self.input_data_dir, 'testing')
         self.mode = mode
-        self.data_shape = (142, 144, 180, 1)
+        self.data_shape = (182, 218, 182, 1)
         self.batch_size = batch_size
         self.shuffle = shuffle
-        self.filenames, self.labels = self.get_imgs_labels_by_mode()
+        self.filenames = self.get_imgs_by_mode()
         self.indexes = list(range(len(self.filenames)))
         self.on_epoch_end()
         if self.shuffle:
@@ -45,12 +45,13 @@ class DataGenerator(Sequence):
  
     def get_imgs_by_mode(self):
         if self.mode == 'training':
-            imgs = self.train_imgcodes
+            imgs = os.listdir(self.train_data_dir)
         elif self.mode == 'testing':
-            imgs = self.test_imgcodes
+            imgs = os.listdir(self.test_data_dir)
         return imgs
     
     def __getitem__(self, index):
+        # x=y for CAE task
         start_idx = index * self.batch_size
         end_idx = (index+1) * self.batch_size
         batch_indexes = self.indexes[start_idx:end_idx]
@@ -58,7 +59,7 @@ class DataGenerator(Sequence):
         x = np.empty((len(batch_indexes), *self.data_shape))
         y = np.empty((len(batch_indexes), *self.data_shape))
         for i, idx in enumerate(batch_indexes):
-            image = os.path.join(self.input_data_dir, self.mode, batch_filenames[i] + '.nii.gz')
+            image = os.path.join(self.input_data_dir, self.mode, batch_filenames[i])
             img = nib.load(image)
             data = img.get_fdata()
             x[i,:,:,:,0] = data
@@ -76,7 +77,7 @@ class T1CAEModel(BaseT1CAE):
 
     def __init__(self, batch_size, epochs):
         super(T1CAEModel, self).__init__()
-        self.input_shape = (142, 144, 180, 1)
+        self.input_shape = (182, 218, 182, 1)
         self.batch_size = batch_size
         self.epochs = epochs
         # mixed precision for training trades computation time for memory
@@ -85,14 +86,16 @@ class T1CAEModel(BaseT1CAE):
 
     def build_model(self):
         # use ANTsPyNet 3D CAE
-        cae = create_convolutional_autoencoder_model_3d(input_image_size=self.input_shape)
-        inputdata = cae.input
-        features = cae.output
-        print(inputdata.shape)
-        print(features.shape)
-        model = Model(inputs=inputdata, outputs=dense4, name='T1CAE')
-        self.compile_model(model)
-        return model
+        autoencoder, encoder = create_convolutional_autoencoder_model_3d(input_image_size=self.input_shape)
+        inputdata = autoencoder.input
+        features = encoder.output
+        reconstructed = autoencoder.output
+        #print(inputdata.shape)
+        #print(features.shape)
+        #autoencoder_model = Model(inputs=inputdata, outputs=reconstructed, name='T1CAE')
+        #encoder_model = Model(inputs=inputdata, outputs=features, name='T1Encoder')
+        self.compile_model(autoencoder)
+        return autoencoder
 
     def compile_model(self, model): 
         mse = MeanSquaredError(reduction='sum_over_batch_size', name='MSE')
@@ -109,9 +112,13 @@ class T1CAEModel(BaseT1CAE):
         print(f'Testing loss: {loss:.8f}')
         print(f'Testing accuracy: {accuracy:.8f}')
 
+    def extract_features(self, model):
+        generator = DataGenerator(batch_size=self.batch_size, mode='')
+        features = model.predict(generator)
+
 
 if __name__ == '__main__':
-    t1cae_model = T1CAEModel(14, 50)
+    t1cae_model = T1CAEModel(15, 50)
     model = t1cae_model.build_model()
     #print(model.summary())
     t1cae_model.train_model(model)

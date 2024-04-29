@@ -170,7 +170,7 @@ class PreprocDataset(BaseT1CAE):
         for img in self.paths.keys():
             logger.info('Registering image ' + img + ' to MNI template')
             try:
-                #self.mgz_to_nii(img)
+                self.mgz_to_nii(img)
                 self.reg_to_template(img)
             except FailedScriptError:
                 continue
