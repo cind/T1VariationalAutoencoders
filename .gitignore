@@ -3,9 +3,10 @@ temp_data/
 atlases/
 venv/
 scripts/
+logs/
 .git/
 __pycache__/
 *.swp
 .nfs*
 nohup.out
-logs/
+notes/
