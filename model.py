@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import nibabel as nib
 import tensorflow as tf
+import matplotlib.pyplot as plt
 from tensorflow import keras
 from tensorflow.keras import Model
 from tensorflow.keras.losses import MeanSquaredError
@@ -30,6 +31,7 @@ class DataGenerator(Sequence):
         self.input_data_dir = os.path.join(self.base_dir, 'data')
         self.train_data_dir = os.path.join(self.input_data_dir, 'training')
         self.test_data_dir = os.path.join(self.input_data_dir, 'testing')
+        self.holdout_data_dir = os.path.join(self.input_data_dir, 'holdout')
         self.mode = mode
         self.data_shape = (180, 220, 180, 1)
         self.batch_size = batch_size
@@ -100,8 +102,6 @@ class T1CAEModel(BaseT1CAE):
         inputdata = autoencoder.input
         features = encoder.output
         reconstructed = autoencoder.output
-        print(inputdata.shape)
-        print(reconstructed.shape)
         self.compile_model(autoencoder)
         return autoencoder
 
@@ -113,8 +113,8 @@ class T1CAEModel(BaseT1CAE):
 
     def train_model(self, model, save=False):
         train_generator = DataGenerator(batch_size=self.batch_size, mode='training')
-        cb = EarlyStopping(monitor='loss', verbose=1, patience=3, start_from_epoch=10)
-        if save == True:
+        cb = EarlyStopping(monitor='loss', verbose=1, patience=5, start_from_epoch=15)
+        if save:
             train_history = model.fit(train_generator, epochs=self.epochs, callbacks=cb)
             return train_history
         else:
@@ -124,7 +124,6 @@ class T1CAEModel(BaseT1CAE):
         test_generator = DataGenerator(batch_size=self.batch_size, mode='testing')
         loss, metric = model.evaluate(test_generator)
         print(f'Testing loss: {loss:.8f}')
-        #print(f'Testing MSE: {metric:.8f}')
 
     def extract_features(self, model):
         generator = DataGenerator(batch_size=self.batch_size, mode='')
@@ -133,11 +132,38 @@ class T1CAEModel(BaseT1CAE):
     def plot_train_progress(self, train_history):
         pass
 
+    def get_middle_slice(self, image):
+        depth = image.shape[2]
+        mid_idx = depth//2
+        return image[:,:,mid_idx]
+    
+    def plot_orig_and_recon(self, autoencoder, n_samples, filepath):
+        # get sample of reconstructed images
+        test_data = DataGenerator(batch_size=self.batch_size, mode='testing')
+        test_data = test_data.test_data_dir
+        indices = np.random.choice(len(test_data), n_samples, replace=False)
+        orig_images = np.take(test_data, indices, axis=0)
+        recon_images = autoencoder.predict(orig_images)
+        # plot original and reconstructed side by side
+        fig, axes = plt.subplots(n_samples, 2, figsize=(10, n_samples*3))
+        for i in range(n_samples):
+            orig_slice = self.get_middle_slice(orig_images[i])
+            axes[i,0].imshow(orig_slice, cmap='gray')
+            axes[i,0].set_title('Original')
+            axes[i,0].axis('off')
+            recon_slice = self.get_middle_slice(recon_images[i])
+            axes[i,1].imshow(recon_slice, cmap='gray')
+            axes[i,1].set_title('Reconstructed')
+            axes[i,1].axis('off')
+        plt.tight_layout()
+        plt.savefig(filepath)
+
 
 if __name__ == '__main__':
-    t1cae_model = T1CAEModel(batch_size=15, epochs=50, fmap_size=50)
+    t1cae_model = T1CAEModel(batch_size=15, epochs=100, fmap_size=50)
     model = t1cae_model.build_model()
     print(model.summary())
     t1cae_model.train_model(model)
     t1cae_model.test_model(model)
+    t1cae_model.plot_orig_and_recon(model, n_samples=5, filepath=os.path.join(os.getcwd(), 'img_recon.png'))
 
