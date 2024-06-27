@@ -10,7 +10,7 @@ from tensorflow import keras
 from tensorflow.keras import Model
 from tensorflow.keras.losses import MeanSquaredError
 from tensorflow.keras.utils import Sequence
-from tensorflow.keras.models import load_model
+from tensorflow.keras.models import load_model, save_model
 from tensorflow.keras.optimizers import Adam, schedules
 from tensorflow.keras.callbacks import EarlyStopping
 from antspynet.architectures import create_convolutional_autoencoder_model_3d
@@ -132,6 +132,9 @@ class T1CAEModel(BaseT1CAE):
     def plot_train_progress(self, train_history):
         pass
 
+    def save_model_to_file(self, model, filepath):
+        save_model(model, filepath)
+    
     def get_middle_slice(self, image):
         depth = image.shape[2]
         mid_idx = depth//2
@@ -139,10 +142,21 @@ class T1CAEModel(BaseT1CAE):
     
     def plot_orig_and_recon(self, autoencoder, n_samples, filepath):
         # get sample of reconstructed images
-        test_data = DataGenerator(batch_size=self.batch_size, mode='testing')
-        test_data = test_data.test_data_dir
+        test_gen = DataGenerator(batch_size=self.batch_size, mode='testing')
+        test_data = test_gen.filenames
         indices = np.random.choice(len(test_data), n_samples, replace=False)
-        orig_images = np.take(test_data, indices, axis=0)
+        orig_images = np.empty((n_samples, *test_gen.data_shape))
+        for i, idx in enumerate(indices):
+            item = test_data[idx]
+            item = os.path.join(os.getcwd(), 'data', 'testing', item)
+            img = nib.load(item)
+            data = img.get_fdata() 
+            # resize from (182,218,182) --> (180,220,180) for network compatibility
+            data = np.pad(data, pad_width=((0,0),(1,1),(0,0)), mode='constant', constant_values=0)
+            data = data[1:181,:,1:181]
+            # min-max scale data from range [0,255] --> [0,1] for training stability
+            data = data/255
+            orig_images[i,:,:,:,0] = data
         recon_images = autoencoder.predict(orig_images)
         # plot original and reconstructed side by side
         fig, axes = plt.subplots(n_samples, 2, figsize=(10, n_samples*3))
@@ -164,6 +178,7 @@ if __name__ == '__main__':
     model = t1cae_model.build_model()
     print(model.summary())
     t1cae_model.train_model(model)
+    t1cae_model.save_model_to_file(model, filepath=os.path.join(os.getcwd(), 'saved_models', 'cae.keras'))
     t1cae_model.test_model(model)
     t1cae_model.plot_orig_and_recon(model, n_samples=5, filepath=os.path.join(os.getcwd(), 'img_recon.png'))
 
