@@ -2,6 +2,7 @@ data/
 temp_data/
 atlases/
 venv/
+saved_models/
 scripts/
 logs/
 .git/
