@@ -10,3 +10,4 @@ tf-keras
 scikit-learn
 tensorrt
 antspynet
+tensorflow-probability

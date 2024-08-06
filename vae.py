@@ -1,4 +1,4 @@
-import os, shutil, string, csv, subprocess, logging, random, gc
+import os, sys, shutil, string, csv, subprocess, logging, random, gc
 from datetime import datetime
 os.environ['OMP_NUM_THREADS'] = '1'
 import numpy as np
@@ -8,16 +8,12 @@ import tensorflow as tf
 import matplotlib.pyplot as plt
 from tensorflow import keras
 from tensorflow.keras import Model
-from tensorflow.keras.layers import Input, Conv3D, Conv3DTranspose, Dense, Flatten, Reshape
-from tensorflow.keras.losses import MeanSquaredError
 from tensorflow.keras.utils import Sequence
 from tensorflow.keras.models import load_model, save_model
-from tensorflow.keras.optimizers import Adam, schedules
-from tensorflow.keras.callbacks import EarlyStopping
 
 # LOCAL IMPORTS
-from preproc import BaseT1CAE
-from variational_autoencoder import create_variational_encoder_decoder, VAE, KLAnnealing
+from variational import VariationalLoss, Sampling, VAE, KLAnnealing, create_variational_encoder_decoder
+from probabalisticVAE import ProbVAE
 from utils import exceptions
 
 logger = logging.getLogger(__name__)
@@ -53,13 +49,11 @@ class DataGenerator(Sequence):
         return imgs
     
     def __getitem__(self, index):
-        # x=y for CAE task
         start_idx = index * self.batch_size
         end_idx = (index+1) * self.batch_size
         batch_indexes = self.indexes[start_idx:end_idx]
         batch_filenames = [self.filenames[i] for i in batch_indexes]
         x = np.empty((len(batch_indexes), *self.data_shape))
-        y = np.empty((len(batch_indexes), *self.data_shape))
         for i, idx in enumerate(batch_indexes):
             image = os.path.join(self.input_data_dir, self.mode, batch_filenames[i])
             img = nib.load(image)
@@ -70,18 +64,35 @@ class DataGenerator(Sequence):
             # min-max scale data from range [0,255] --> [0,1] for training stability
             data = data/255
             x[i,:,:,:,0] = data
-            y[i,:,:,:,0] = data
-        return x, y
+        return x
 
+    def get_random_sample(self, n_samples):
+        """Use for test data generator only"""
+        test_data = self.filenames
+        indices = np.random.choice(len(test_data), n_samples, replace=False)
+        x = np.empty((n_samples, *self.data_shape))
+        for i, idx in enumerate(indices):
+            item = test_data[idx]
+            item = os.path.join(os.getcwd(), 'data', 'CN_ABneg', 'testing', item)
+            img = nib.load(item)
+            data = img.get_fdata() 
+            # resize from (182,218,182) --> (180,220,180) for network compatibility
+            data = np.pad(data, pad_width=((0,0),(1,1),(0,0)), mode='constant', constant_values=0)
+            data = data[1:181,:,1:181]
+            # min-max scale data from range [0,255] --> [0,1] for training stability
+            data = data/255
+            x[i,:,:,:,0] = data
+        return x    
+    
     def on_epoch_end(self):
         if self.shuffle:
             random.shuffle(self.indexes)
 
 
-class T1VAEModel(BaseT1CAE):
+class T1VAEModel():
 
     '''AI model using custom variational autoencoder
-    built off ANTs CAE'''
+    with encoding/decoding architecture inspired by ANTs CAE'''
 
     def __init__(self, batch_size, epochs, fmap_size):
         super(T1VAEModel, self).__init__()
@@ -89,46 +100,53 @@ class T1VAEModel(BaseT1CAE):
         self.batch_size = batch_size
         self.epochs = epochs
         self.fmap_size = fmap_size
+        self.train_data = DataGenerator(batch_size=self.batch_size, mode='training')
+        self.test_data = DataGenerator(batch_size=self.batch_size, mode='testing')
         # mixed precision for training trades computation time for memory
         policy = tf.keras.mixed_precision.Policy('mixed_float16')
         tf.keras.mixed_precision.set_global_policy(policy)
 
-    def build_model(self):
+    def build_model(self, model_type):
         '''Builds/compiles VAE'''
-        encoder, decoder = create_variational_encoder_decoder(
-                        input_image_size=self.input_shape,
-                        number_of_filters_per_layer=(32,64,128,self.fmap_size),
-                        convolution_kernel_size=(5,5,5),
-                        deconvolution_kernel_size=(5,5,5))
-        vae = VAE(encoder, decoder, 0.001)
-        lr_schedule = schedules.ExponentialDecay(initial_learning_rate=0.0001, decay_steps=1000, decay_rate=0.9)
-        opt = Adam(learning_rate=lr_schedule)
-        vae.compile(optimizer=opt)
-        return vae, encoder, decoder
+        if model_type == 'vae':
+            vae = VAE(input_shape=self.input_shape, fmap_size=self.fmap_size, kl_weight=1.0)
+        elif model_type == 'prob_vae':
+            vae = ProbVAE(input_shape=self.input_shape, fmap_size=self.fmap_size, kl_weight=1.0)
+        vae.build()
+        return vae
+    
+    def get_annealer(self, model, startweight, endweight, n_epochs):
+        kl = KLAnnealing(model, kl_start=startweight, kl_end=endweight, annealing_epochs=n_epochs)
+        return kl
     
     def train_model(self, model):
-        train_generator = DataGenerator(batch_size=self.batch_size, mode='training')
-        kl = KLAnnealing(model, kl_start=0.001, kl_end=1.0, annealing_epochs=10)
-        model.fit(train_generator, epochs=self.epochs, callbacks=kl)
+        #kl = self.get_annealer(model, 0.001, 1.0, 10)
+        model.fit(self.train_data, epochs=self.epochs)
 
-    def train_and_save_model(self, model):
-        train_generator = DataGenerator(batch_size=self.batch_size, mode='training')
-        cb = EarlyStopping(monitor='loss', verbose=1, patience=5, start_from_epoch=15)
-        train_history = model.fit(train_generator, epochs=self.epochs, callbacks=cb)
+    def train_and_save_model(self, model, callbacks=None):
+        train_history = model.fit(self.train_data, epochs=self.epochs, callbacks=callbacks)
         return train_history
     
     def test_model(self, model):
-        test_generator = DataGenerator(batch_size=self.batch_size, mode='testing')
-        loss, metric = model.evaluate(test_generator)
-        print(f'Testing loss: {loss:.8f}')
+        loss = model.evaluate(self.test_data)
 
     def extract_features(self, model):
-        generator = DataGenerator(batch_size=self.batch_size, mode='')
-        features = model.predict(generator)
+        features = model.encoder.predict(self.test_data)
 
     def plot_train_progress(self, train_history):
         pass
 
+    def load_model_from_file(self, filepath, model_type):
+        if model_type == 'vae':
+            objs = {'VAE': VAE,
+                    'Sampling': Sampling,
+                    'VariationalLoss': VariationalLoss,
+                    'KLAnnealing': KLAnnealing,
+                    'create_variational_encoder_decoder': create_variational_encoder_decoder}
+        elif model_type == 'prob_vae':
+            objs = {'ProbVAE': ProbVAE}
+        load_model(filepath, custom_objects=objs, compile=True)
+    
     def save_model_to_file(self, model, filepath):
         save_model(model, filepath)
     
@@ -139,21 +157,7 @@ class T1VAEModel(BaseT1CAE):
     
     def plot_orig_and_recon(self, autoencoder, n_samples, filepath):
         # get sample of reconstructed images
-        test_gen = DataGenerator(batch_size=self.batch_size, mode='testing')
-        test_data = test_gen.filenames
-        indices = np.random.choice(len(test_data), n_samples, replace=False)
-        orig_images = np.empty((n_samples, *test_gen.data_shape))
-        for i, idx in enumerate(indices):
-            item = test_data[idx]
-            item = os.path.join(os.getcwd(), 'data', 'testing', item)
-            img = nib.load(item)
-            data = img.get_fdata() 
-            # resize from (182,218,182) --> (180,220,180) for network compatibility
-            data = np.pad(data, pad_width=((0,0),(1,1),(0,0)), mode='constant', constant_values=0)
-            data = data[1:181,:,1:181]
-            # min-max scale data from range [0,255] --> [0,1] for training stability
-            data = data/255
-            orig_images[i,:,:,:,0] = data
+        orig_images = self.test_data.get_random_sample(n_samples)
         recon_images = autoencoder.predict(orig_images)
         # plot original and reconstructed side by side
         fig, axes = plt.subplots(n_samples, 2, figsize=(10, n_samples*3))
@@ -172,13 +176,16 @@ class T1VAEModel(BaseT1CAE):
 
 if __name__ == '__main__':
     gc.collect()
-    t1vae_model = T1VAEModel(batch_size=13, epochs=100, fmap_size=10)
-    vae, encoder, decoder = t1vae_model.build_model()
-    print(vae.summary())
-    print(encoder.summary())
-    print(decoder.summary())
+    model_filepath = os.path.join(os.getcwd(), 'saved_models', 'probvae_fmap10_epochs10.keras')
+    vis_filepath = os.path.join(os.getcwd(), 'probvae_img_recon_fmap10_epochs10.png')
+    t1vae_model = T1VAEModel(batch_size=13, epochs=10, fmap_size=10)
+    vae = t1vae_model.build_model(model_type='prob_vae')
+    #print(vae.summary())
+    print(vae.encoder.summary())
+    print(vae.decoder.summary())
+    #t1vae_model.load_model_from_file(model_filepath, model_type='prob_vae')
     t1vae_model.train_model(vae)
-    t1vae_model.save_model_to_file(vae, filepath=os.path.join(os.getcwd(), 'saved_models', 'vae_fmap10.keras'))
     t1vae_model.test_model(vae)
-    t1vae_model.plot_orig_and_recon(vae, n_samples=5, filepath=os.path.join(os.getcwd(), 'img_recon_fmap10.png'))
+    t1vae_model.save_model_to_file(vae, filepath=model_filepath)
+    t1vae_model.plot_orig_and_recon(vae, n_samples=5, filepath=vis_filepath)
 
