@@ -49,7 +49,7 @@ class BaseT1CAE:
         self.datetime = datetime.now().strftime("%Y.%m.%d.%H%M.%S")
         self.base_dir = os.getcwd()
         # paths for image data
-        self.T1_list = [line.replace('\n','') for line in open('ADNI_T1s.txt', 'r')]
+        self.T1_list = [line.replace('\n','') for line in open('pt_data/ADNI_T1s.txt', 'r')]
         self.data_temp_dir = os.path.join(self.base_dir, 'temp_data')
         self.data_dir = os.path.join(self.base_dir, 'data')
         self.atlas = os.path.join(self.base_dir, 'atlases', 'MNI152_T1_1mm_brain.nii.gz')
@@ -71,10 +71,6 @@ class BaseT1CAE:
             mgz = '/m/InProcess/External/' + proj_name + '/Freesurfer/subjects/' + t + '/mri/brain.mgz'
             path_dict[t] = mgz
         return path_dict
-    
-    def split_train_test(self):
-        # 80/20 train/test split
-        pass
     
     def load_nii(self, fname):
         try:

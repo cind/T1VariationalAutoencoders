@@ -1,7 +1,8 @@
 import math
+import gc
 import numpy as np
 import tensorflow as tf
-import tensorflow_probability as tfp
+#import tensorflow_probability as tfp
 from tensorflow import keras
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Layer, Input, Conv3D, Conv3DTranspose, Dense, Flatten, Reshape
@@ -18,68 +19,46 @@ class ProbVAE(Model):
         super(ProbVAE, self).__init__(**kwargs)
         self.input_shape = input_shape
         self.fmap_size = fmap_size
-        self.kl_weight = tf.Variable(kl_weight, trainable=False, dtype=tf.float16)
+        self.kl_weight = tf.Variable(kl_weight, trainable=False, dtype=tf.float32)
         self.total_loss_tracker = keras.metrics.Mean(name='total_loss')
         # architecture parameters
         self.strides = (2, 2, 2)
-        self.kernel = (5, 5, 5)
         self.activation = 'relu'
-        self.filters = (32, 64, 128)
+        self.filters = [32, 64, 128]
         self.factor = 2 ** len(self.filters)
         # build encoder and decoder components
         self.encoder = self.create_variational_encoder()
         self.decoder = self.create_variational_decoder()
         # define optimizer
         lr_sched = schedules.ExponentialDecay(initial_learning_rate=0.0001, decay_steps=1000, decay_rate=0.9)
-        self.opt = Adam(learning_rate=lr_sched, clipnorm=1.0)
+        optimizer = Adam(learning_rate=lr_sched, clipnorm=1.0)
+        self.opt = tf.keras.mixed_precision.LossScaleOptimizer(optimizer)
 
     def reparameterize(self, mean, logvar):
-        batch = len(mean)
-        latent = len(mean[0])
-        eps = tf.random.normal(shape=(batch, latent))
-        eps = tf.cast(eps, dtype=tf.float16)
+        batchsize = keras.ops.shape(mean)[0]
+        eps = tf.random.normal(shape=(batchsize, self.fmap_size))
+        eps = tf.cast(eps, dtype=tf.float32)
         return eps * tf.exp(0.5 * logvar) + mean
 
-    def encode(self, inputs):
-        tf.print('input shape:', inputs.shape)
-        mean, logvar = self.encoder(inputs)
-        return mean, logvar
-
-    def decode(self, z, apply_sigmoid=False):
-        recon = self.decoder(z)
-        if apply_sigmoid:
-            probs = tf.sigmoid(recon)
-            return probs
-        return recon
-    
     def log_normal_pdf(self, sample, mean, logvar, raxis=1):
-        sample = tf.cast(sample, dtype=tf.float16)
-        mean = tf.cast(mean, dtype=tf.float16)
-        logvar = tf.cast(logvar, dtype=tf.float16)
         log2pi = tf.math.log(2.0*np.pi)
-        log2pi = tf.cast(log2pi, dtype=tf.float16)
         sq_diff = (sample - mean) ** 2
-        sq_diff = tf.cast(sq_diff, dtype=tf.float16)
         elogvar = tf.exp(-logvar)
-        elogvar = tf.cast(elogvar, dtype=tf.float16)
         rslt = tf.reduce_sum(-0.5 * (sq_diff * elogvar + logvar + log2pi), axis=raxis)
         return rslt
     
-    def compute_loss(self, inputs):
+    def compute_loss(self, data, recon, z, z_mean, z_logvar):
         """
-        Forward pass through model and return total loss.
+        Called after forward pass through model and returns total loss.
         Computed by optimizing single-sample Monte Carlo estimate of ELBO.
         log(p(x|z)): reconstruction loss (MSE)
         log(p(z)): prior distribution on latent space
         log(q(z|x)): encoder distribution
         """
-        inputs = tf.cast(inputs, dtype=tf.float16)
-        mean, logvar = self.encode(inputs)
-        z = self.reparameterize(mean, logvar)
-        recon = self.decode(z)
-        logpx_z = tf.reduce_mean(tf.square(inputs - recon))
+        data = tf.cast(data, dtype=tf.float32)
+        logpx_z = tf.reduce_mean(tf.square(data - recon))
         logpz = self.log_normal_pdf(z, 0.0, 0.0)
-        logqz_x = self.log_normal_pdf(z, mean, logvar)
+        logqz_x = self.log_normal_pdf(z, z_mean, z_logvar)
         loss = -tf.reduce_mean(logpx_z + logpz - logqz_x)
         self.track(loss)
         return loss
@@ -89,62 +68,68 @@ class ProbVAE(Model):
         Defines model forward pass.
         Takes in data and returns reconstructed data.
         """
-        mean, logvar = self.encode(inputs)
-        z = self.reparameterize(mean, logvar)
-        recon = self.decode(z)
+        inputs = tf.cast(inputs, dtype=tf.float32)
+        z_mean, z_logvar = self.encoder(inputs)
+        z = self.reparameterize(z_mean, z_logvar)
+        recon = self.decoder(z)
+        self.add_loss(self.compute_loss(inputs, recon, z, z_mean, z_logvar))
         return recon
+    
+    def forward_pass(self, inputs):
+        """
+        Wrapper for forward pass computation in train/test step.
+        Ensures datatype consistency and returns intermediate values: 
+        z, z_mean, z_logvar as well as reconstruction for loss computation.
+        """
+        inputs = tf.cast(inputs, dtype=tf.float32)
+        z_mean, z_logvar = self.encoder(inputs)
+        #z_mean = tf.cast(z_mean, dtype=tf.float32)
+        #z_logvar = tf.cast(z_logvar, dtype=tf.float32)
+        z = self.reparameterize(z_mean, z_logvar)
+        #z = tf.cast(z, dtype=tf.float32)
+        recon = self.decoder(z)
+        #recon = tf.cast(recon, dtype=tf.float32)
+        return recon, z, z_mean, z_logvar
     
     def build(self):
         self.compile(optimizer=self.opt, metrics=self.metrics)
     
-    @tf.function
-    def train_step(self, inputs):
+    #@tf.function
+    def train_step(self, data):
         """
         Executes one training step and returns loss.
         """
+        data = data[0]
         with tf.GradientTape() as tape:
-            loss = self.compute_loss(inputs)
+            recon, z, z_mean, z_logvar = self.forward_pass(data)
+            loss = self.compute_loss(data, recon, z, z_mean, z_logvar)
         grads = tape.gradient(loss, self.trainable_weights)
         self.opt.apply_gradients(zip(grads, self.trainable_weights))
         return loss
     
     @tf.function
-    def test_step(self, inputs):
-        loss = self.compute_loss(inputs)
+    def test_step(self, data):
+        data = data[0]
+        recon, z, z_mean, z_logvar = self.forward_pass(data)
+        loss = self.compute_loss(data, recon, z, z_mean, z_logvar)
         return loss
     
     def create_variational_encoder(self):
-        padding = 'valid'
-        if self.input_shape[0] % self.factor == 0:
-            padding = 'same'
         inputs = Input(shape = self.input_shape)
         x = inputs
-        
-        for i in range(len(self.filters)):
-            local_padding = 'same'
-            kernel_size = self.kernel
-            if i == (len(self.filters) - 1):
-                local_padding = padding
-                kernel_size = tuple(np.array(self.kernel) - 2)
-
-            x = Conv3D(filters=self.filters[i],
-                         kernel_size=kernel_size,
-                         strides=self.strides,
-                         activation=self.activation,
-                         padding=local_padding,
-                         kernel_initializer='he_normal')(x)
-
+        x = Conv3D(filters=self.filters[0], kernel_size=(5,5,5), strides=self.strides, 
+                activation=self.activation, padding='same', kernel_initializer='he_normal')(x)
+        x = Conv3D(filters=self.filters[1], kernel_size=(5,5,5), strides=self.strides,
+                activation=self.activation, padding='same', kernel_initializer='he_normal')(x)
+        x = Conv3D(filters=self.filters[2], kernel_size=(3,3,3), strides=self.strides,
+                activation=self.activation, padding='valid', kernel_initializer='he_normal')(x)
         x = Flatten()(x)
         z_mean = Dense(self.fmap_size, name='z_mean')(x)
         z_log_var = Dense(self.fmap_size, name='z_log_var')(x)
-        
         encoder = Model(inputs, [z_mean, z_log_var], name='encoder')
         return encoder
 
     def create_variational_decoder(self):
-        padding = 'valid'
-        if self.input_shape[0] % self.factor == 0:
-            padding = 'same'
         shape_before_flatten = (self.input_shape[0]//self.factor,
                                 self.input_shape[1]//self.factor,
                                 self.input_shape[2]//self.factor,
@@ -152,27 +137,12 @@ class ProbVAE(Model):
         decoder_input = Input(shape=(self.fmap_size,))
         x = Dense(np.prod(shape_before_flatten), activation=self.activation)(decoder_input)
         x = Reshape(target_shape=shape_before_flatten)(x)
-        
-        for i in range(len(self.filters), 1, -1):
-            local_padding = 'same'
-            kernel_size = self.kernel
-            if i == len(self.filters):
-                local_padding = padding
-                kernel_size = tuple(np.array(self.kernel) - 2)
-
-            x = Conv3DTranspose(filters=self.filters[i-1],
-                kernel_size=kernel_size,
-                strides=self.strides,
-                activation=self.activation,
-                padding=local_padding,
-                kernel_initializer='he_normal')(x) 
-
-        outputs = Conv3DTranspose(filters=self.input_shape[-1],
-            kernel_size=self.kernel,
-            strides=self.strides,
-            padding='same',
-            kernel_initializer='he_normal')(x)
-
+        x = Conv3DTranspose(filters=self.filters[1], kernel_size=(3,3,3), strides=self.strides,
+                activation=self.activation, padding='valid', kernel_initializer='he_normal')(x)
+        x = Conv3DTranspose(filters=self.filters[0], kernel_size=(5,5,5), strides=self.strides,
+                activation=self.activation, padding='same', kernel_initializer='he_normal')(x)
+        outputs = Conv3DTranspose(filters=1, kernel_size=(5,5,5), strides=self.strides,
+                activation='linear', padding='same', kernel_initializer='he_normal')(x)
         decoder = Model(decoder_input, outputs, name='decoder')
         return decoder
 
@@ -187,7 +157,7 @@ class ProbVAE(Model):
     def sample(self, eps=None):
         if eps is None:
             eps = tf.random.normal(shape=(100, self.fmap_size))
-        return self.decode(eps, apply_sigmoid=True)
+        return self.decoder(eps)
     
     def get_config(self):
         config = super().get_config().copy()

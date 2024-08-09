@@ -1,4 +1,5 @@
 import math
+import gc
 import numpy as np
 import tensorflow as tf
 from tensorflow import keras
@@ -46,81 +47,6 @@ class Sampling(Layer):
         return z_mean + tf.exp(0.5 * z_log_var) * epsilon
 
 
-def create_variational_encoder_decoder(input_image_size, latent_dim):
-    """
-    Function for creating the encoder and decoder components
-    of a 3-D symmetric variational convolutional autoencoder model.
-    """
-
-    activation = 'relu'
-    strides = (2, 2, 2)
-    conv_kernel = (5, 5, 5)
-    deconv_kernel = (5, 5, 5)
-    n_filters = (32, 64, 128)
-    n_encoding_layers = len(n_filters)
-    factor = 2 ** n_encoding_layers
-
-    padding = 'valid'
-    if input_image_size[0] % factor == 0:
-        padding = 'same'
-
-    inputs = Input(shape = input_image_size)
-    x = inputs
-
-    # Encoder
-    for i in range(n_encoding_layers):
-        local_padding = 'same'
-        kernel_size = conv_kernel
-        if i == (n_encoding_layers - 1):
-            local_padding = padding
-            kernel_size = tuple(np.array(conv_kernel) - 2)
-
-        x = Conv3D(filters=n_filters[i],
-                         kernel_size=kernel_size,
-                         strides=strides,
-                         activation=activation,
-                         padding=local_padding,
-                         kernel_initializer='he_normal')(x)
-
-    shape_before_flattening = tf.keras.backend.int_shape(x)[1:]
-    x = Flatten()(x)
-    #x = Dense(units=256, activation=activation)(x)
-
-    z_mean = Dense(latent_dim, name='z_mean')(x)
-    z_log_var = Dense(latent_dim, name='z_log_var')(x)
-    z = Sampling()([z_mean, z_log_var])
-
-    # Decoder
-    #decoder_input = Input(shape=(latent_dim,))
-    x = Dense(np.prod(shape_before_flattening), activation=activation)(z)
-    x = Reshape(target_shape=shape_before_flattening)(x)
-
-    for i in range(n_encoding_layers, 1, -1):
-        local_padding = 'same'
-        kernel_size = conv_kernel
-        if i == n_encoding_layers:
-            local_padding = padding
-            kernel_size = tuple(np.array(deconv_kernel) - 2)
-
-        x = Conv3DTranspose(filters=n_filters[i-1],
-                kernel_size=kernel_size,
-                strides=strides,
-                activation=activation,
-                padding=local_padding,
-                kernel_initializer='he_normal')(x) 
-    
-    outputs = Conv3DTranspose(filters=input_image_size[-1],
-            kernel_size=deconv_kernel,
-            strides=strides,
-            padding='same',
-            kernel_initializer='he_normal')(x)
-
-    # model outputs
-    encoder = Model(inputs, [z_mean, z_log_var, z], name='encoder')
-    decoder = Model(z, outputs, name='decoder')
-    return encoder, decoder
-
-
 class KLAnnealing(Callback):
     """
     Applies KL divergence annealing to gradually increase KL weight over several epochs.
@@ -151,15 +77,21 @@ class VAE(Model):
         self.input_shape = input_shape
         self.fmap_size = fmap_size
         self.kl_weight = tf.Variable(kl_weight, trainable=False, dtype=tf.float16)
-        self.encoder, self.decoder = create_variational_encoder_decoder(
-                        input_image_size=self.input_shape,
-                        latent_dim=self.fmap_size)
+        # set architecture parameters
+        self.activation = 'relu'
+        self.strides = (2,2,2)
+        self.filters = [32,64,128]
+        self.factor = 2 ** len(self.filters)
+        self.encoder = self.create_variational_encoder()
+        self.decoder = self.create_variational_decoder()
+        # set loss, metrics, optimizer
         self.loss_fn = VariationalLoss(kl_weight=self.kl_weight)
         self.total_loss_tracker = keras.metrics.Mean(name='total_loss')
         self.recon_loss_tracker = keras.metrics.Mean(name='recon_loss')
         self.kl_loss_tracker = keras.metrics.Mean(name='kl_loss')
         lr_sched = schedules.ExponentialDecay(initial_learning_rate=0.0001, decay_steps=1000, decay_rate=0.9)
-        self.opt = Adam(learning_rate=lr_sched, clipnorm=1.0)
+        optimizer = Adam(learning_rate=lr_sched, clipnorm=1.0)
+        self.opt = tf.keras.mixed_precision.LossScaleOptimizer(optimizer)
 
     @property
     def metrics(self):
@@ -185,7 +117,7 @@ class VAE(Model):
     
     @tf.function
     def train_step(self, inputs):
-        inputs = tf.cast(inputs, dtype=tf.float16)
+        inputs = inputs[0]
         with tf.GradientTape() as tape:
             z_mean, z_log_var, z = self.encoder(inputs)
             recon = self.decoder(z)
@@ -197,12 +129,46 @@ class VAE(Model):
 
     @tf.function
     def test_step(self, inputs):
+        inputs = inputs[0]
         z_mean, z_log_var, z = self.encoder(inputs)
         recon = self.decoder(z)
         total_loss, recon_loss, kl_loss = self.loss_fn(inputs, recon, z_mean, z_log_var)
         self.track_metrics(total_loss, recon_loss, kl_loss)
         return {m.name: m.result() for m in self.metrics}
 
+    def create_variational_encoder(self):
+        inputs = Input(shape = self.input_shape)
+        x = inputs
+        x = Conv3D(filters=self.filters[0], kernel_size=(5,5,5), strides=self.strides, 
+                activation=self.activation, padding='same', kernel_initializer='he_normal')(x)
+        x = Conv3D(filters=self.filters[1], kernel_size=(5,5,5), strides=self.strides,
+                activation=self.activation, padding='same', kernel_initializer='he_normal')(x)
+        x = Conv3D(filters=self.filters[2], kernel_size=(3,3,3), strides=self.strides,
+                activation=self.activation, padding='valid', kernel_initializer='he_normal')(x)
+        x = Flatten()(x)
+        z_mean = Dense(self.fmap_size, name='z_mean')(x)
+        z_log_var = Dense(self.fmap_size, name='z_log_var')(x)
+        z = Sampling()([z_mean, z_log_var])
+        encoder = Model(inputs, [z_mean, z_log_var, z], name='encoder')
+        return encoder
+
+    def create_variational_decoder(self):
+        shape_before_flatten = (self.input_shape[0]//self.factor,
+                                self.input_shape[1]//self.factor,
+                                self.input_shape[2]//self.factor,
+                                self.filters[-1])
+        decoder_input = Input(shape=(self.fmap_size,))
+        x = Dense(np.prod(shape_before_flatten), activation=self.activation)(decoder_input)
+        x = Reshape(target_shape=shape_before_flatten)(x)
+        x = Conv3DTranspose(filters=self.filters[1], kernel_size=(3,3,3), strides=self.strides,
+                activation=self.activation, padding='valid', kernel_initializer='he_normal')(x)
+        x = Conv3DTranspose(filters=self.filters[0], kernel_size=(5,5,5), strides=self.strides,
+                activation=self.activation, padding='same', kernel_initializer='he_normal')(x)
+        outputs = Conv3DTranspose(filters=1, kernel_size=(5,5,5), strides=self.strides,
+                activation='linear', padding='same', kernel_initializer='he_normal')(x)
+        decoder = Model(decoder_input, outputs, name='decoder')
+        return decoder
+   
     def get_config(self):
         config = super().get_config().copy()
         config.update({'input_shape': self.input_shape,

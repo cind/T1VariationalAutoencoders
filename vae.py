@@ -12,7 +12,7 @@ from tensorflow.keras.utils import Sequence
 from tensorflow.keras.models import load_model, save_model
 
 # LOCAL IMPORTS
-from variational import VariationalLoss, Sampling, VAE, KLAnnealing, create_variational_encoder_decoder
+from variational import VariationalLoss, Sampling, VAE, KLAnnealing
 from probabalisticVAE import ProbVAE
 from utils import exceptions
 
@@ -21,7 +21,9 @@ logger = logging.getLogger(__name__)
 
 class DataGenerator(Sequence):
     
-    '''Custom data generator to handle 4D batches.'''
+    """
+    Custom data generator to handle 4D batches.
+    """
     def __init__(self, batch_size, mode, shuffle=True):
         super(DataGenerator, self).__init__()
         self.base_dir = os.getcwd()
@@ -54,6 +56,7 @@ class DataGenerator(Sequence):
         batch_indexes = self.indexes[start_idx:end_idx]
         batch_filenames = [self.filenames[i] for i in batch_indexes]
         x = np.empty((len(batch_indexes), *self.data_shape))
+        #y = np.empty((len(batch_indexes), *self.data_shape))
         for i, idx in enumerate(batch_indexes):
             image = os.path.join(self.input_data_dir, self.mode, batch_filenames[i])
             img = nib.load(image)
@@ -64,6 +67,7 @@ class DataGenerator(Sequence):
             # min-max scale data from range [0,255] --> [0,1] for training stability
             data = data/255
             x[i,:,:,:,0] = data
+            #y[i,:,:,:,0] = data
         return x
 
     def get_random_sample(self, n_samples):
@@ -82,7 +86,7 @@ class DataGenerator(Sequence):
             # min-max scale data from range [0,255] --> [0,1] for training stability
             data = data/255
             x[i,:,:,:,0] = data
-        return x    
+        return x
     
     def on_epoch_end(self):
         if self.shuffle:
@@ -90,9 +94,10 @@ class DataGenerator(Sequence):
 
 
 class T1VAEModel():
-
-    '''AI model using custom variational autoencoder
-    with encoding/decoding architecture inspired by ANTs CAE'''
+    """
+    AI model using custom variational autoencoder
+    with encoding/decoding architecture inspired by ANTs CAE
+    """
 
     def __init__(self, batch_size, epochs, fmap_size):
         super(T1VAEModel, self).__init__()
@@ -107,7 +112,7 @@ class T1VAEModel():
         tf.keras.mixed_precision.set_global_policy(policy)
 
     def build_model(self, model_type):
-        '''Builds/compiles VAE'''
+        """Builds/compiles VAE"""
         if model_type == 'vae':
             vae = VAE(input_shape=self.input_shape, fmap_size=self.fmap_size, kl_weight=1.0)
         elif model_type == 'prob_vae':
@@ -120,7 +125,7 @@ class T1VAEModel():
         return kl
     
     def train_model(self, model):
-        #kl = self.get_annealer(model, 0.001, 1.0, 10)
+        kl = self.get_annealer(model, 0.001, 1.0, 10)
         model.fit(self.train_data, epochs=self.epochs)
 
     def train_and_save_model(self, model, callbacks=None):
@@ -130,9 +135,6 @@ class T1VAEModel():
     def test_model(self, model):
         loss = model.evaluate(self.test_data)
 
-    def extract_features(self, model):
-        features = model.encoder.predict(self.test_data)
-
     def plot_train_progress(self, train_history):
         pass
 
@@ -141,8 +143,7 @@ class T1VAEModel():
             objs = {'VAE': VAE,
                     'Sampling': Sampling,
                     'VariationalLoss': VariationalLoss,
-                    'KLAnnealing': KLAnnealing,
-                    'create_variational_encoder_decoder': create_variational_encoder_decoder}
+                    'KLAnnealing': KLAnnealing}
         elif model_type == 'prob_vae':
             objs = {'ProbVAE': ProbVAE}
         load_model(filepath, custom_objects=objs, compile=True)
@@ -176,10 +177,11 @@ class T1VAEModel():
 
 if __name__ == '__main__':
     gc.collect()
-    model_filepath = os.path.join(os.getcwd(), 'saved_models', 'probvae_fmap10_epochs10.keras')
-    vis_filepath = os.path.join(os.getcwd(), 'probvae_img_recon_fmap10_epochs10.png')
+    tf.keras.backend.clear_session()
+    model_filepath = os.path.join(os.getcwd(), 'saved_models', 'vae_fmap10_epochs10.keras')
+    vis_filepath = os.path.join(os.getcwd(), 'vae_img_recon_fmap10_epochs10.png')
     t1vae_model = T1VAEModel(batch_size=13, epochs=10, fmap_size=10)
-    vae = t1vae_model.build_model(model_type='prob_vae')
+    vae = t1vae_model.build_model(model_type='vae')
     #print(vae.summary())
     print(vae.encoder.summary())
     print(vae.decoder.summary())
