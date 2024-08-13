@@ -42,7 +42,7 @@ class DataGenerator(Sequence):
 
     def __len__(self):
         return len(self.filenames)//self.batch_size
- 
+
     def get_imgs_by_mode(self):
         if self.mode == 'training':
             imgs = os.listdir(self.train_data_dir)
@@ -125,8 +125,8 @@ class T1VAEModel():
         return kl
     
     def train_model(self, model):
-        kl = self.get_annealer(model, 0.001, 1.0, 10)
-        model.fit(self.train_data, epochs=self.epochs)
+        kl = self.get_annealer(model, 0.001, 1.0, 20)
+        model.fit(self.train_data, epochs=self.epochs, callbacks=kl)
 
     def train_and_save_model(self, model, callbacks=None):
         train_history = model.fit(self.train_data, epochs=self.epochs, callbacks=callbacks)
@@ -178,9 +178,9 @@ class T1VAEModel():
 if __name__ == '__main__':
     gc.collect()
     tf.keras.backend.clear_session()
-    model_filepath = os.path.join(os.getcwd(), 'saved_models', 'vae_fmap10_epochs10.keras')
-    vis_filepath = os.path.join(os.getcwd(), 'vae_img_recon_fmap10_epochs10.png')
-    t1vae_model = T1VAEModel(batch_size=13, epochs=10, fmap_size=10)
+    model_filepath = os.path.join(os.getcwd(), 'saved_models', 'vae_fmap50_epochs100.keras')
+    vis_filepath = os.path.join(os.getcwd(), 'vae_img_recon_fmap50_epochs100.png')
+    t1vae_model = T1VAEModel(batch_size=13, epochs=100, fmap_size=50)
     vae = t1vae_model.build_model(model_type='vae')
     #print(vae.summary())
     print(vae.encoder.summary())
