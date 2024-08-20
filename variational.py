@@ -9,23 +9,33 @@ from tensorflow.keras.layers import Layer, Input, Conv3D, Conv3DTranspose, Dense
 from tensorflow.keras.losses import Loss, MeanSquaredError
 from tensorflow.keras.optimizers import Adam, schedules
 from tensorflow.keras.callbacks import Callback
+from tensorflow.keras.utils import register_keras_serializable
 
 
+@register_keras_serializable(package='variational')
 class VariationalLoss(Loss):
     """
     Computes loss for VAE as
     total_loss = MSE + kl_weight * kl_loss
     """
-    def __init__(self, kl_weight, name='variational_loss'):
-        super().__init__(name=name)
+    def __init__(self, kl_weight, name='variational_loss', reduction=tf.keras.losses.Reduction.SUM_OVER_BATCH_SIZE):
+        super().__init__(name=name, reduction=reduction)
         self.recon_loss_fn = MeanSquaredError()
         self.kl_weight = kl_weight
 
+    def get_config(self):
+        config = super(VariationalLoss, self).get_config()
+        return config
+    
     def __call__(self, inputs, recon, z_mean, z_log_var):
         recon_loss = tf.cast(self.recon_loss_fn(inputs, recon), dtype=tf.float16)
         kl_loss = -0.5 * tf.reduce_mean(1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var))
         total_loss = recon_loss + self.kl_weight * kl_loss
         return total_loss, recon_loss, kl_loss
+
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
 
 
 class Sampling(Layer):
@@ -51,19 +61,22 @@ class KLAnnealing(Callback):
     """
     Applies KL divergence annealing to gradually increase KL weight over several epochs.
     """
-    def __init__(self, vae, kl_start, kl_end, annealing_epochs):
+    def __init__(self, vae, kl_start, kl_end, annealing_epochs, start_epoch=0):
         super(KLAnnealing, self).__init__()
         self.vae = vae
         self.kl_start = kl_start
         self.kl_end = kl_end
         self.annealing_epochs = annealing_epochs
+        self.start_epoch = start_epoch
         self.kl_schedule = np.linspace(kl_start, kl_end, annealing_epochs)
 
     def on_epoch_begin(self, epoch, logs=None): 
-        if epoch < self.annealing_epochs:
-            new_kl_weight = self.kl_schedule[epoch]
-        else:
+        if epoch >= self.start_epoch and epoch < self.start_epoch + self.annealing_epochs:
+            new_kl_weight = self.kl_schedule[epoch - self.start_epoch]
+        elif epoch >= self.start_epcohs + self.annealing_epochs:
             new_kl_weight = self.kl_end
+        else:
+            new_kl_weight = self.kl_start
         self.vae.kl_weight.assign(new_kl_weight)
         print(f"\nEpoch {epoch+1}: KL weight set to {new_kl_weight}")
 

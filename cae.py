@@ -182,14 +182,14 @@ class T1CAEModel():
 
 if __name__ == '__main__':
     gc.collect()
-    model_filepath = os.path.join(os.getcwd(), 'saved_models', 'cae_fmap10_50epochs.keras')
-    vis_filepath = os.path.join(os.getcwd(), 'cae_img_recon_fmap10_50epochs.png')
-    t1cae_model = T1CAEModel(batch_size=13, epochs=50, fmap_size=10)
+    model_filepath = os.path.join(os.getcwd(), 'saved_models', 'cae_fmap128_100epochs_ctrldata.keras')
+    vis_filepath = os.path.join(os.getcwd(), 'cae_img_recon_fmap128_100epochs_ctrldata.png')
+    t1cae_model = T1CAEModel(batch_size=13, epochs=100, fmap_size=128)
     model = t1cae_model.build_model()
     print(model.summary())
     t1cae_model.train_model(model)
     t1cae_model.save_model_to_file(model, filepath=model_filepath)
     #model = t1cae_model.load_model_from_file(model_filepath)
     t1cae_model.test_model(model)
-    t1cae_model.plot_orig_and_recon(model, n_samples=5, filepath=vis_filepath)
+    t1cae_model.plot_orig_and_recon(model, n_samples=10, filepath=vis_filepath)
 

@@ -78,8 +78,8 @@ class DataGenerator(Sequence):
         x = np.empty((n_samples, *self.data_shape))
         for i, idx in enumerate(indices):
             item = test_data[idx]
-            item = os.path.join(os.getcwd(), 'data', 'CN_ABneg', 'testing', item)
-            img = nib.load(item)
+            item_fullpath = os.path.join(os.getcwd(), 'data', 'CN_ABneg', 'testing', item)
+            img = nib.load(item_fullpath)
             data = img.get_fdata() 
             # resize from (182,218,182) --> (180,220,180) for network compatibility
             data = np.pad(data, pad_width=((0,0),(1,1),(0,0)), mode='constant', constant_values=0)
@@ -121,28 +121,24 @@ class AutoencoderTransfer():
         vae.build()
         return vae
     
-    def get_annealer(self, model, startweight, endweight, n_epochs):
-        kl = KLAnnealing(model, kl_start=startweight, kl_end=endweight, annealing_epochs=n_epochs)
+    def get_annealer(self, model, startkl, endkl, n, start):
+        kl = KLAnnealing(model, kl_start=startkl, kl_end=endkl, annealing_epochs=n, start_epoch=start)
         return kl
     
-    def transfer_weights(self, cae, vae):
+    def transfer_weights_fromCAE(self, cae, vae):
         """Transfers weights from each CAE layer to each VAE layer"""
         enc_layers = cae.layers[:5]
         bottleneck_layer = cae.layers[5]
         dec_layers = cae.layers[5:]
         for i in range(len(vae.encoder.layers)):
             if i < len(enc_layers):
-                print(enc_layers[i].name)
                 vae.encoder.layers[i].set_weights(enc_layers[i].get_weights())
         for i in range(len(vae.decoder.layers)):
-            print('decoding layers', i)
-            print(vae.decoder.layers[i].name)
             if i < len(dec_layers) and i > 0:
-                print(dec_layers[i].name)
                 vae.decoder.layers[i].set_weights(dec_layers[i].get_weights())
     
     def train_model(self, model):
-        kl = self.get_annealer(model, 0.001, 1.0, 10)
+        kl = self.get_annealer(model, 0, 0.5, 50, 25)
         model.fit(self.train_data, epochs=self.epochs, callbacks=kl)
 
     def train_and_save_model(self, model, callbacks=None):
@@ -165,44 +161,57 @@ class AutoencoderTransfer():
     def save_model_to_file(self, model, filepath):
         save_model(model, filepath)
     
-    def get_middle_slice(self, image):
+    def get_slices(self, image):
         depth = image.shape[2]
-        mid_idx = depth//2
-        return image[:,:,mid_idx]
+        idx_1_3 = depth//3
+        idx_1_2 = depth//2
+        idx_2_3 = 2 * depth//3
+        return [image[:,:,idx_1_3], image[:,:,idx_1_2], image[:,:,idx_2_3]]
     
     def plot_orig_and_recon(self, autoencoder, n_samples, filepath):
         # get sample of reconstructed images
         orig_images = self.test_data.get_random_sample(n_samples)
         recon_images = autoencoder.predict(orig_images)
         # plot original and reconstructed side by side
-        fig, axes = plt.subplots(n_samples, 2, figsize=(10, n_samples*3))
+        fig, axes = plt.subplots(n_samples, 6, figsize=(15, n_samples*3))
+        slice_lbls = ['1/3', '1/2', '2/3']
         for i in range(n_samples):
-            orig_slice = self.get_middle_slice(orig_images[i])
-            axes[i,0].imshow(orig_slice, cmap='gray')
-            axes[i,0].set_title('Original')
-            axes[i,0].axis('off')
-            recon_slice = self.get_middle_slice(recon_images[i])
-            axes[i,1].imshow(recon_slice, cmap='gray')
-            axes[i,1].set_title('Reconstructed')
-            axes[i,1].axis('off')
-        plt.tight_layout()
+            orig_slices = self.get_slices(orig_images[i])
+            recon_slices = self.get_slices(recon_images[i])
+            # plot original slices
+            for j, orig_slice in enumerate(orig_slices):
+                axes[i,j].imshow(orig_slice, cmap='gray')
+                if i == 0:
+                    axes[i,j].set_title(slice_lbls[j])
+                axes[i,j].axis('off')    
+            # plot reconstructed slices
+            for j, recon_slice in enumerate(recon_slices):
+                axes[i,j+3].imshow(recon_slice, cmap='gray')
+                if i == 0:
+                    axes[i,j+3].set_title(slice_lbls[j])
+                axes[i,j+3].axis('off')
+        # overall titles
+        fig.text(0.25, 0.96, 'Original', ha='center', fontsize=16)
+        fig.text(0.75, 0.96, 'Reconstructed', ha='center', fontsize=16)
+        plt.tight_layout(rect=[0,0,1,0.95])
         plt.savefig(filepath)
 
 
 if __name__ == '__main__':
     gc.collect()
     tf.keras.backend.clear_session()
-    cae_filepath = os.path.join(os.getcwd(), 'saved_models', 'cae_fmap10_50epochs.keras')
-    vae_filepath = os.path.join(os.getcwd(), 'saved_models', 'transfer_vae_fmap10_epochs50.keras')
-    vis_filepath = os.path.join(os.getcwd(), 'transfer_vae_img_recon_fmap10_epochs50.png')
-    transfer_model = AutoencoderTransfer(batch_size=13, epochs=50, fmap_size=10)
+    cae_filepath = os.path.join(os.getcwd(), 'saved_models', 'cae_fmap128_100epochs_ctrldata.keras')
+    vae_filepath = os.path.join(os.getcwd(), 'saved_models', 'transfer_vae_fmap128_epochs100_slowanneal.keras')
+    vis_filepath = os.path.join(os.getcwd(), 'transfer_vae_img_recon_fmap128_epochs100_slowanneal.png')
+    transfer_model = AutoencoderTransfer(batch_size=13, epochs=100, fmap_size=128)
     cae = transfer_model.load_cae_from_file(cae_filepath)
     vae = transfer_model.build_vae()
-    transfer_model.transfer_weights(cae, vae)
+    transfer_model.transfer_weights_fromCAE(cae, vae)
     print(vae.encoder.summary())
     print(vae.decoder.summary())
     transfer_model.train_model(vae)
     transfer_model.test_model(vae)
     transfer_model.save_model_to_file(vae, filepath=vae_filepath)
-    transfer_model.plot_orig_and_recon(vae, n_samples=5, filepath=vis_filepath)
+    #vae = transfer_model.load_vae_from_file(vae_filepath)
+    transfer_model.plot_orig_and_recon(vae, n_samples=10, filepath=vis_filepath)
 
