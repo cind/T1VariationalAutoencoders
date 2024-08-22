@@ -10,9 +10,10 @@ from tensorflow import keras
 from tensorflow.keras import Model
 from tensorflow.keras.utils import Sequence
 from tensorflow.keras.models import load_model, save_model
+from tensorflow.keras.callbacks import EarlyStopping
+from antspynet.architectures import create_convolutional_autoencoder_model_3d
 
 # LOCAL IMPORTS
-from ants_CAE import create_convolutional_autoencoder_model_3d
 from variational import VariationalLoss, Sampling, VAE, KLAnnealing
 from probabalisticVAE import ProbVAE
 from utils import exceptions
@@ -117,7 +118,7 @@ class AutoencoderTransfer():
     
     def build_vae(self):
         """Builds/compiles VAE"""
-        vae = VAE(input_shape=self.input_shape, fmap_size=self.fmap_size, kl_weight=1.0)
+        vae = VAE(input_shape=self.input_shape, fmap_size=self.fmap_size, kl_weight=0.0)
         vae.build()
         return vae
     
@@ -139,7 +140,8 @@ class AutoencoderTransfer():
     
     def train_model(self, model):
         kl = self.get_annealer(model, 0, 0.5, 50, 25)
-        model.fit(self.train_data, epochs=self.epochs, callbacks=kl)
+        es = EarlyStopping(monitor='total_loss', verbose=1, patience=5, start_from_epoch=20, mode='min')
+        model.fit(self.train_data, epochs=self.epochs, callbacks=es)
 
     def train_and_save_model(self, model, callbacks=None):
         train_history = model.fit(self.train_data, epochs=self.epochs, callbacks=callbacks)
@@ -201,8 +203,8 @@ if __name__ == '__main__':
     gc.collect()
     tf.keras.backend.clear_session()
     cae_filepath = os.path.join(os.getcwd(), 'saved_models', 'cae_fmap128_100epochs_ctrldata.keras')
-    vae_filepath = os.path.join(os.getcwd(), 'saved_models', 'transfer_vae_fmap128_epochs100_slowanneal.keras')
-    vis_filepath = os.path.join(os.getcwd(), 'transfer_vae_img_recon_fmap128_epochs100_slowanneal.png')
+    vae_filepath = os.path.join(os.getcwd(), 'saved_models', 'transfer_vae_fmap128_epochs100_noKLD.keras')
+    vis_filepath = os.path.join(os.getcwd(), 'transfer_vae_img_recon_fmap128_epochs100_noKLD.png')
     transfer_model = AutoencoderTransfer(batch_size=13, epochs=100, fmap_size=128)
     cae = transfer_model.load_cae_from_file(cae_filepath)
     vae = transfer_model.build_vae()

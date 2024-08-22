@@ -13,9 +13,9 @@ from tensorflow.keras.utils import Sequence
 from tensorflow.keras.models import load_model, save_model
 from tensorflow.keras.optimizers import Adam, schedules
 from tensorflow.keras.callbacks import EarlyStopping
+from antspynet.architectures import create_convolutional_autoencoder_model_3d
 
 # LOCAL IMPORTS
-from ants_CAE import create_convolutional_autoencoder_model_3d
 from utils import exceptions
 
 logger = logging.getLogger(__name__)

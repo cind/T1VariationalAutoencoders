@@ -73,7 +73,7 @@ class KLAnnealing(Callback):
     def on_epoch_begin(self, epoch, logs=None): 
         if epoch >= self.start_epoch and epoch < self.start_epoch + self.annealing_epochs:
             new_kl_weight = self.kl_schedule[epoch - self.start_epoch]
-        elif epoch >= self.start_epcohs + self.annealing_epochs:
+        elif epoch >= self.start_epoch + self.annealing_epochs:
             new_kl_weight = self.kl_end
         else:
             new_kl_weight = self.kl_start
@@ -102,7 +102,7 @@ class VAE(Model):
         self.total_loss_tracker = keras.metrics.Mean(name='total_loss')
         self.recon_loss_tracker = keras.metrics.Mean(name='recon_loss')
         self.kl_loss_tracker = keras.metrics.Mean(name='kl_loss')
-        lr_sched = schedules.ExponentialDecay(initial_learning_rate=0.0001, decay_steps=1000, decay_rate=0.9)
+        lr_sched = schedules.ExponentialDecay(initial_learning_rate=0.0005, decay_steps=1000, decay_rate=0.9)
         optimizer = Adam(learning_rate=lr_sched, clipnorm=1.0)
         self.opt = tf.keras.mixed_precision.LossScaleOptimizer(optimizer)
 
@@ -159,8 +159,8 @@ class VAE(Model):
         x = Conv3D(filters=self.filters[2], kernel_size=(3,3,3), strides=self.strides,
                 activation=self.activation, padding='valid', kernel_initializer='he_normal')(x)
         x = Flatten()(x)
-        z_mean = Dense(self.fmap_size, name='z_mean')(x)
-        z_log_var = Dense(self.fmap_size, name='z_log_var')(x)
+        z_mean = Dense(self.fmap_size, name='z_mean', kernel_initializer='he_normal')(x)
+        z_log_var = Dense(self.fmap_size, name='z_log_var', kernel_initializer='he_normal')(x)
         z = Sampling()([z_mean, z_log_var])
         encoder = Model(inputs, [z_mean, z_log_var, z], name='encoder')
         return encoder
