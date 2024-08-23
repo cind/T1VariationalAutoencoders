@@ -7,7 +7,6 @@ from keras import ops
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Layer, Input, Conv3D, Conv3DTranspose, Dense, Flatten, Reshape
 from tensorflow.keras.losses import Loss, MeanSquaredError
-from tensorflow.keras.optimizers import Adam, schedules
 from tensorflow.keras.callbacks import Callback
 from tensorflow.keras.utils import register_keras_serializable
 
@@ -53,13 +52,14 @@ class Sampling(Layer):
         batch = ops.shape(z_mean)[0]
         dim = ops.shape(z_mean)[1]
         epsilon = keras.random.normal(shape=(batch,dim), seed=self.seed_generator)
-        epsilon = tf.cast(epsilon, dtype=tf.float16)
+        epsilon = tf.cast(epsilon, dtype=z_mean.dtype)
         return z_mean + tf.exp(0.5 * z_log_var) * epsilon
 
 
 class KLAnnealing(Callback):
     """
-    Applies KL divergence annealing to gradually increase KL weight over several epochs.
+    Applies KL divergence annealing to gradually increase KL weight linearly over several epochs.
+    If variance drops below threshold, increase KL weight by increment.
     """
     def __init__(self, vae, kl_start, kl_end, annealing_epochs, start_epoch=0):
         super(KLAnnealing, self).__init__()
@@ -68,9 +68,25 @@ class KLAnnealing(Callback):
         self.kl_end = kl_end
         self.annealing_epochs = annealing_epochs
         self.start_epoch = start_epoch
+        self.var_threshold = 1e-4
+        self.kl_increment = 0.1
         self.kl_schedule = np.linspace(kl_start, kl_end, annealing_epochs)
 
-    def on_epoch_begin(self, epoch, logs=None): 
+    def var_too_small(self, epoch):
+        if epoch >= self.start_epoch:
+            z_mean, z_log_var = self.encoder.predict(self.model.validation_data[0])
+            var = tf.exp(z_log_var)
+            avg_var = tf.reduce_mean(var)
+            if avg_var < self.var_threshold:
+                print(f"\n[Warning] Low variance detected: {avg_var.numpy():.5f} at epoch {epoch+1}. Increasing KL weight.")
+                current_kl_weight = self.vae.kl_weight.numpy()
+                new_kl_weight = current_kl_weight + self.kl_increment
+                self.vae.kl_weight.assign(new_kl_weight)
+                return True
+            else:
+                return False
+    
+    def anneal(self, epoch): 
         if epoch >= self.start_epoch and epoch < self.start_epoch + self.annealing_epochs:
             new_kl_weight = self.kl_schedule[epoch - self.start_epoch]
         elif epoch >= self.start_epoch + self.annealing_epochs:
@@ -79,6 +95,16 @@ class KLAnnealing(Callback):
             new_kl_weight = self.kl_start
         self.vae.kl_weight.assign(new_kl_weight)
         print(f"\nEpoch {epoch+1}: KL weight set to {new_kl_weight}")
+
+    def on_epoch_end(self, epoch, logs=None):
+        """
+        Checks variance first and update if too low after start_epoch regardless of annealing schedule. 
+        If variance above threshold, proceed with annealing schedule.
+        """
+        if self.var_too_small(epoch):
+            pass
+        else:
+            self.anneal(epoch)
 
 
 class VAE(Model):
@@ -95,6 +121,7 @@ class VAE(Model):
         self.strides = (2,2,2)
         self.filters = [32,64,128]
         self.factor = 2 ** len(self.filters)
+        self.lr = 0.001
         self.encoder = self.create_variational_encoder()
         self.decoder = self.create_variational_decoder()
         # set loss, metrics, optimizer
@@ -102,9 +129,10 @@ class VAE(Model):
         self.total_loss_tracker = keras.metrics.Mean(name='total_loss')
         self.recon_loss_tracker = keras.metrics.Mean(name='recon_loss')
         self.kl_loss_tracker = keras.metrics.Mean(name='kl_loss')
-        lr_sched = schedules.ExponentialDecay(initial_learning_rate=0.0005, decay_steps=1000, decay_rate=0.9)
-        optimizer = Adam(learning_rate=lr_sched, clipnorm=1.0)
-        self.opt = tf.keras.mixed_precision.LossScaleOptimizer(optimizer)
+        lr_sched = tf.keras.optimizers.schedules.ExponentialDecay(initial_learning_rate=self.lr, decay_steps=1000, decay_rate=0.9)
+        optimizer0 = tf.keras.optimizers.Adam(learning_rate=lr_sched, clipnorm=1.0)
+        optimizer1 = tf.keras.optimizers.RMSprop(learning_rate=lr_sched, clipnorm=1.0)
+        self.opt = tf.keras.mixed_precision.LossScaleOptimizer(optimizer1)
 
     @property
     def metrics(self):

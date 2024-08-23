@@ -10,7 +10,7 @@ from tensorflow import keras
 from tensorflow.keras import Model
 from tensorflow.keras.utils import Sequence
 from tensorflow.keras.models import load_model, save_model
-from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.callbacks import EarlyStopping, CallbackList
 from antspynet.architectures import create_convolutional_autoencoder_model_3d
 
 # LOCAL IMPORTS
@@ -31,6 +31,7 @@ class DataGenerator(Sequence):
         self.base_dir = os.getcwd()
         self.input_data_dir = os.path.join(self.base_dir, 'data', 'CN_ABneg')
         self.train_data_dir = os.path.join(self.input_data_dir, 'training')
+        self.val_data_dir = os.path.join(self.input_data_dir, 'validation')
         self.test_data_dir = os.path.join(self.input_data_dir, 'testing')
         self.mode = mode
         self.data_shape = (180, 220, 180, 1)
@@ -48,6 +49,8 @@ class DataGenerator(Sequence):
     def get_imgs_by_mode(self):
         if self.mode == 'training':
             imgs = os.listdir(self.train_data_dir)
+        elif self.mode == 'validation':
+            imgs = os.listdir(self.val_data_dir)
         elif self.mode == 'testing':
             imgs = os.listdir(self.test_data_dir)
         return imgs
@@ -58,7 +61,6 @@ class DataGenerator(Sequence):
         batch_indexes = self.indexes[start_idx:end_idx]
         batch_filenames = [self.filenames[i] for i in batch_indexes]
         x = np.empty((len(batch_indexes), *self.data_shape))
-        #y = np.empty((len(batch_indexes), *self.data_shape))
         for i, idx in enumerate(batch_indexes):
             image = os.path.join(self.input_data_dir, self.mode, batch_filenames[i])
             img = nib.load(image)
@@ -69,7 +71,6 @@ class DataGenerator(Sequence):
             # min-max scale data from range [0,255] --> [0,1] for training stability
             data = data/255
             x[i,:,:,:,0] = data
-            #y[i,:,:,:,0] = data
         return x
 
     def get_random_sample(self, n_samples):
@@ -108,6 +109,7 @@ class AutoencoderTransfer():
         self.epochs = epochs
         self.fmap_size = fmap_size
         self.train_data = DataGenerator(batch_size=self.batch_size, mode='training')
+        self.val_data = DataGenerator(batch_size=self.batch_size, mode='validation')
         self.test_data = DataGenerator(batch_size=self.batch_size, mode='testing')
         # mixed precision for training trades computation time for memory
         policy = tf.keras.mixed_precision.Policy('mixed_float16')
@@ -118,14 +120,10 @@ class AutoencoderTransfer():
     
     def build_vae(self):
         """Builds/compiles VAE"""
-        vae = VAE(input_shape=self.input_shape, fmap_size=self.fmap_size, kl_weight=0.0)
+        vae = VAE(input_shape=self.input_shape, fmap_size=self.fmap_size, kl_weight=1.0)
         vae.build()
         return vae
-    
-    def get_annealer(self, model, startkl, endkl, n, start):
-        kl = KLAnnealing(model, kl_start=startkl, kl_end=endkl, annealing_epochs=n, start_epoch=start)
-        return kl
-    
+     
     def transfer_weights_fromCAE(self, cae, vae):
         """Transfers weights from each CAE layer to each VAE layer"""
         enc_layers = cae.layers[:5]
@@ -139,9 +137,11 @@ class AutoencoderTransfer():
                 vae.decoder.layers[i].set_weights(dec_layers[i].get_weights())
     
     def train_model(self, model):
-        kl = self.get_annealer(model, 0, 0.5, 50, 25)
+        kl = KLAnnealing(model, 0, 0.5, 30, 10)
         es = EarlyStopping(monitor='total_loss', verbose=1, patience=5, start_from_epoch=20, mode='min')
-        model.fit(self.train_data, epochs=self.epochs, callbacks=es)
+        cbs = CallbackList([kl, es])
+        cbs.set_model(model)
+        model.fit(self.train_data, validation_data=self.val_data, epochs=self.epochs, callbacks=cbs)
 
     def train_and_save_model(self, model, callbacks=None):
         train_history = model.fit(self.train_data, epochs=self.epochs, callbacks=callbacks)
@@ -202,10 +202,10 @@ class AutoencoderTransfer():
 if __name__ == '__main__':
     gc.collect()
     tf.keras.backend.clear_session()
-    cae_filepath = os.path.join(os.getcwd(), 'saved_models', 'cae_fmap128_100epochs_ctrldata.keras')
-    vae_filepath = os.path.join(os.getcwd(), 'saved_models', 'transfer_vae_fmap128_epochs100_noKLD.keras')
-    vis_filepath = os.path.join(os.getcwd(), 'transfer_vae_img_recon_fmap128_epochs100_noKLD.png')
-    transfer_model = AutoencoderTransfer(batch_size=13, epochs=100, fmap_size=128)
+    cae_filepath = os.path.join(os.getcwd(), 'saved_models', 'CAE_CN_ABneg', 'fmap128_epochs100.keras')
+    vae_filepath = os.path.join(os.getcwd(), 'saved_models', 'transferCAE_VAE', 'fmap128_epochs50_var_annealing.keras')
+    vis_filepath = os.path.join(os.getcwd(), 'transfer_vae_img_recon_fmap128_epochs50_var_annealing.png')
+    transfer_model = AutoencoderTransfer(batch_size=10, epochs=50, fmap_size=128)
     cae = transfer_model.load_cae_from_file(cae_filepath)
     vae = transfer_model.build_vae()
     transfer_model.transfer_weights_fromCAE(cae, vae)
