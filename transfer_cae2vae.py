@@ -137,16 +137,13 @@ class AutoencoderTransfer():
                 vae.decoder.layers[i].set_weights(dec_layers[i].get_weights())
     
     def train_model(self, model):
-        kl = KLAnnealing(model, 0, 0.5, 30, 10)
+        kl = KLAnnealing(model, self.val_data, 0, 0.5, 30, 10, verbose=1)
         es = EarlyStopping(monitor='total_loss', verbose=1, patience=5, start_from_epoch=20, mode='min')
         cbs = CallbackList([kl, es])
         cbs.set_model(model)
-        model.fit(self.train_data, validation_data=self.val_data, epochs=self.epochs, callbacks=cbs)
+        history = model.fit(self.train_data, validation_data=self.val_data, epochs=self.epochs, verbose=1, callbacks=cbs)
+        return history
 
-    def train_and_save_model(self, model, callbacks=None):
-        train_history = model.fit(self.train_data, epochs=self.epochs, callbacks=callbacks)
-        return train_history
-    
     def test_model(self, model):
         loss = model.evaluate(self.test_data)
 

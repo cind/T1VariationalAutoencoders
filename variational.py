@@ -1,5 +1,4 @@
-import math
-import gc
+import os, math, gc, logging, random
 import numpy as np
 import tensorflow as tf
 from tensorflow import keras
@@ -9,6 +8,8 @@ from tensorflow.keras.layers import Layer, Input, Conv3D, Conv3DTranspose, Dense
 from tensorflow.keras.losses import Loss, MeanSquaredError
 from tensorflow.keras.callbacks import Callback
 from tensorflow.keras.utils import register_keras_serializable
+
+logger = logging.getLogger(__name__)
 
 
 @register_keras_serializable(package='variational')
@@ -61,9 +62,10 @@ class KLAnnealing(Callback):
     Applies KL divergence annealing to gradually increase KL weight linearly over several epochs.
     If variance drops below threshold, increase KL weight by increment.
     """
-    def __init__(self, vae, kl_start, kl_end, annealing_epochs, start_epoch=0):
+    def __init__(self, vae, validation_data, kl_start, kl_end, annealing_epochs, start_epoch=0, verbose=1):
         super(KLAnnealing, self).__init__()
         self.vae = vae
+        self.validation_data = validation_data
         self.kl_start = kl_start
         self.kl_end = kl_end
         self.annealing_epochs = annealing_epochs
@@ -72,19 +74,27 @@ class KLAnnealing(Callback):
         self.kl_increment = 0.1
         self.kl_schedule = np.linspace(kl_start, kl_end, annealing_epochs)
 
+    def get_sample_var(self):
+        rand_idx = random.randint(0, len(self.validation_data)-1)
+        sample = self.validation_data[rand_idx]
+        z_mean, z_log_var, z = self.vae.encoder.predict(sample)
+        var = tf.exp(z_log_var)
+        return tf.reduce_mean(var)
+    
     def var_too_small(self, epoch):
         if epoch >= self.start_epoch:
-            z_mean, z_log_var = self.encoder.predict(self.model.validation_data[0])
-            var = tf.exp(z_log_var)
-            avg_var = tf.reduce_mean(var)
+            avg_var = self.get_sample_var()
             if avg_var < self.var_threshold:
-                print(f"\n[Warning] Low variance detected: {avg_var.numpy():.5f} at epoch {epoch+1}. Increasing KL weight.")
+                logger.info(f"\n[Warning] Low variance detected: {avg_var.numpy():.5f} at epoch {epoch+1}. Increasing KL weight.")
                 current_kl_weight = self.vae.kl_weight.numpy()
                 new_kl_weight = current_kl_weight + self.kl_increment
                 self.vae.kl_weight.assign(new_kl_weight)
                 return True
             else:
+                logger.info(f"\nVariance acceptable at epoch {epoch+1}.")
                 return False
+        else:
+            logger.info(f"\nEpoch {epoch+1}: annealing not yet initiated.")
     
     def anneal(self, epoch): 
         if epoch >= self.start_epoch and epoch < self.start_epoch + self.annealing_epochs:
@@ -94,16 +104,18 @@ class KLAnnealing(Callback):
         else:
             new_kl_weight = self.kl_start
         self.vae.kl_weight.assign(new_kl_weight)
-        print(f"\nEpoch {epoch+1}: KL weight set to {new_kl_weight}")
+        logger.info(f"\nEpoch {epoch+1}: KL weight set to {new_kl_weight}.")
 
     def on_epoch_end(self, epoch, logs=None):
         """
         Checks variance first and update if too low after start_epoch regardless of annealing schedule. 
         If variance above threshold, proceed with annealing schedule.
         """
+        #self.anneal(epoch)
         if self.var_too_small(epoch):
-            pass
+            logger.info(f"\nKL annealing overriden by variance adjustment.")
         else:
+            logger.info(f"\nProceeding with KL annealing at epoch {epoch+1}.")
             self.anneal(epoch)
 
 
@@ -116,6 +128,7 @@ class VAE(Model):
         self.input_shape = input_shape
         self.fmap_size = fmap_size
         self.kl_weight = tf.Variable(kl_weight, trainable=False, dtype=tf.float16)
+        self.history = None
         # set architecture parameters
         self.activation = 'relu'
         self.strides = (2,2,2)
@@ -145,7 +158,7 @@ class VAE(Model):
         """
         Defines forward pass
         Inputs: image inputs
-        Outputs: reconstructed image, z_mean, z_log_var (needed for loss computation)
+        Outputs: reconstructed image
         """
         z_mean, z_log_var, z = self.encoder(inputs)
         recon = self.decoder(z)
@@ -177,6 +190,12 @@ class VAE(Model):
         self.track_metrics(total_loss, recon_loss, kl_loss)
         return {m.name: m.result() for m in self.metrics}
 
+    def fit(self, *args, **kwargs):
+        """Set attributes in keras fit method"""
+        self.verbose = kwargs.get('verbose', 1)
+        self.history = super(VAE, self).fit(*args, **kwargs)
+        return self.history
+    
     def create_variational_encoder(self):
         inputs = Input(shape = self.input_shape)
         x = inputs
