@@ -14,7 +14,7 @@ from tensorflow.keras.callbacks import EarlyStopping, CallbackList
 from antspynet.architectures import create_convolutional_autoencoder_model_3d
 
 # LOCAL IMPORTS
-from variational import VariationalLoss, Sampling, VAE, KLAnnealing
+from variational import VariationalLoss, Sampling, VAE, KLAnnealing, LatentSpaceVarMonitoring
 from probabalisticVAE import ProbVAE
 from utils import exceptions
 
@@ -33,6 +33,7 @@ class DataGenerator(Sequence):
         self.train_data_dir = os.path.join(self.input_data_dir, 'training')
         self.val_data_dir = os.path.join(self.input_data_dir, 'validation')
         self.test_data_dir = os.path.join(self.input_data_dir, 'testing')
+        self.mask_file = os.path.join(self.base_dir, 'atlases', 'MNI152_T1_1mm_mask.nii.gz')
         self.mode = mode
         self.data_shape = (180, 220, 180, 1)
         self.batch_size = batch_size
@@ -46,6 +47,12 @@ class DataGenerator(Sequence):
     def __len__(self):
         return len(self.filenames)//self.batch_size
 
+    def get_mask(self):
+        mask = nib.load(self.mask_file).get_fdata()
+        mask = np.pad(mask, pad_width=((0,0),(1,1),(0,0)), mode='constant', constant_values=0)
+        mask = mask[1:181,:,1:181]
+        return mask
+    
     def get_imgs_by_mode(self):
         if self.mode == 'training':
             imgs = os.listdir(self.train_data_dir)
@@ -70,6 +77,9 @@ class DataGenerator(Sequence):
             data = data[1:181,:,1:181]
             # min-max scale data from range [0,255] --> [0,1] for training stability
             data = data/255
+            # apply mask to explicitly zero out background
+            mask = self.get_mask()
+            data = data * mask
             x[i,:,:,:,0] = data
         return x
 
@@ -83,11 +93,11 @@ class DataGenerator(Sequence):
             item_fullpath = os.path.join(os.getcwd(), 'data', 'CN_ABneg', 'testing', item)
             img = nib.load(item_fullpath)
             data = img.get_fdata() 
-            # resize from (182,218,182) --> (180,220,180) for network compatibility
             data = np.pad(data, pad_width=((0,0),(1,1),(0,0)), mode='constant', constant_values=0)
             data = data[1:181,:,1:181]
-            # min-max scale data from range [0,255] --> [0,1] for training stability
             data = data/255
+            mask = self.get_mask()
+            data = data * mask
             x[i,:,:,:,0] = data
         return x
     
@@ -120,28 +130,30 @@ class AutoencoderTransfer():
     
     def build_vae(self):
         """Builds/compiles VAE"""
-        vae = VAE(input_shape=self.input_shape, fmap_size=self.fmap_size, kl_weight=1.0)
+        vae = VAE(input_shape=self.input_shape, fmap_size=self.fmap_size, kl_weight=1.0, batch_size=self.batch_size)
         vae.build()
         return vae
      
     def transfer_weights_fromCAE(self, cae, vae):
-        """Transfers weights from each CAE layer to each VAE layer"""
+        """Transfers weights from each CAE layer to each VAE layer where applicable"""
         enc_layers = cae.layers[:5]
         bottleneck_layer = cae.layers[5]
         dec_layers = cae.layers[5:]
         for i in range(len(vae.encoder.layers)):
             if i < len(enc_layers):
                 vae.encoder.layers[i].set_weights(enc_layers[i].get_weights())
+        vae.encoder.layers[5].set_weights(bottleneck_layer.get_weights())
         for i in range(len(vae.decoder.layers)):
             if i < len(dec_layers) and i > 0:
                 vae.decoder.layers[i].set_weights(dec_layers[i].get_weights())
     
     def train_model(self, model):
-        kl = KLAnnealing(model, self.val_data, 0, 0.5, 30, 10, verbose=1)
-        es = EarlyStopping(monitor='total_loss', verbose=1, patience=5, start_from_epoch=20, mode='min')
-        cbs = CallbackList([kl, es])
-        cbs.set_model(model)
-        history = model.fit(self.train_data, validation_data=self.val_data, epochs=self.epochs, verbose=1, callbacks=cbs)
+        kl_anneal = KLAnnealing(model, self.val_data, 0, 0.5, 30, 10, verbose=1)
+        var_monitor = LatentSpaceVarMonitoring(model, self.val_data, 1e-4, 0.1, 0)
+        early_stop = EarlyStopping(monitor='total_loss', verbose=1, patience=5, start_from_epoch=20, mode='min')
+        #cbs = CallbackList([kl_anneal, early_stop])
+        #cbs.set_model(model)
+        history = model.fit(self.train_data, validation_data=self.val_data, epochs=self.epochs, verbose=1, callbacks=early_stop)
         return history
 
     def test_model(self, model):
@@ -154,7 +166,8 @@ class AutoencoderTransfer():
         objs = {'VAE': VAE,
                 'Sampling': Sampling,
                 'VariationalLoss': VariationalLoss,
-                'KLAnnealing': KLAnnealing}
+                'KLAnnealing': KLAnnealing,
+                'LatentSpaceVarMonitoring': LatentSpaceVarMonitoring}
         return load_model(filepath, custom_objects=objs, compile=True)
     
     def save_model_to_file(self, model, filepath):
@@ -200,8 +213,8 @@ if __name__ == '__main__':
     gc.collect()
     tf.keras.backend.clear_session()
     cae_filepath = os.path.join(os.getcwd(), 'saved_models', 'CAE_CN_ABneg', 'fmap128_epochs100.keras')
-    vae_filepath = os.path.join(os.getcwd(), 'saved_models', 'transferCAE_VAE', 'fmap128_epochs50_var_annealing.keras')
-    vis_filepath = os.path.join(os.getcwd(), 'transfer_vae_img_recon_fmap128_epochs50_var_annealing.png')
+    vae_filepath = os.path.join(os.getcwd(), 'saved_models', 'transferCAE_VAE', 'fmap128_epochs50_noclip_scale.keras')
+    vis_filepath = os.path.join(os.getcwd(), 'transfer_vae_img_recon_fmap128_epochs50_noclip_scale.png')
     transfer_model = AutoencoderTransfer(batch_size=10, epochs=50, fmap_size=128)
     cae = transfer_model.load_cae_from_file(cae_filepath)
     vae = transfer_model.build_vae()
