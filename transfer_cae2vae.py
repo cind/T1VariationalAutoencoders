@@ -142,7 +142,7 @@ class AutoencoderTransfer():
         for i in range(len(vae.encoder.layers)):
             if i < len(enc_layers):
                 vae.encoder.layers[i].set_weights(enc_layers[i].get_weights())
-        vae.encoder.layers[5].set_weights(bottleneck_layer.get_weights())
+        #vae.encoder.layers[5].set_weights(bottleneck_layer.get_weights())
         for i in range(len(vae.decoder.layers)):
             if i < len(dec_layers) and i > 0:
                 vae.decoder.layers[i].set_weights(dec_layers[i].get_weights())
