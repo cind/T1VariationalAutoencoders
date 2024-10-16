@@ -8,7 +8,7 @@ from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Layer, Input, Conv3D, Conv3DTranspose, Dense, Flatten, Reshape
 from tensorflow.keras.losses import Loss, MeanSquaredError
 from tensorflow.keras.callbacks import Callback
-from tensorflow.keras.utils import register_keras_serializable
+from tensorflow.keras.utils import register_keras_serializable, Progbar
 
 logger = logging.getLogger(__name__)
 
@@ -16,9 +16,8 @@ logger = logging.getLogger(__name__)
 @register_keras_serializable(package='variational')
 class VariationalLoss(Loss):
     """
-    Computes loss for VAE as
-    total_loss = MSE + kl_weight * kl_loss
-    Additional penalty for attempting to reconstruct the background
+    Computes loss for VAE as total_loss = MSE + kl_weight * kl_loss
+    Additional gradient penalty regularization and weight map for foreground focus
     """
     def __init__(self, kl_weight, name='variational_loss', reduction=tf.keras.losses.Reduction.SUM_OVER_BATCH_SIZE):
         super().__init__(name=name, reduction=reduction)
@@ -31,13 +30,21 @@ class VariationalLoss(Loss):
     
     def __call__(self, inputs, recon, z_mean, z_log_var, weight_map):
         recon_loss = tf.cast(self.recon_loss_fn(inputs, recon), dtype=tf.float16)
-        # try weighting recon loss by weight map to increase bg penalty
-        recon_loss = weight_map * recon_loss
-        #bg_penalty = tf.reduce_mean(tf.square(recon * (1 - mask)))
+        #recon_loss = weight_map * recon_loss
+        # add gradient penalty
+        gradient_penalty = self.gradient_penalty_loss(inputs, recon)
         kl_loss = -0.5 * tf.reduce_mean(1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var))
-        total_loss = recon_loss + self.kl_weight * kl_loss
-        return total_loss, recon_loss, kl_loss
+        total_loss = recon_loss + self.kl_weight * kl_loss + gradient_penalty
+        return total_loss, recon_loss, kl_loss, gradient_penalty
 
+    def gradient_penalty_loss(self, y_true, y_pred, sample_weight=None):
+        """Gradient penalty regularization"""
+        gradients = tf.gradients(y_pred, y_true)[0]
+        gradient_l2_norm = tf.sqrt(tf.reduce_sum(tf.square(gradients), axis=[1,2,3]))
+        gradient_penalty = tf.reduce_mean(tf.square(gradient_l2_norm - 1.0))
+        gradient_penalty = tf.cast(gradient_penalty, dtype=tf.float16)
+        return gradient_penalty
+    
     @classmethod
     def from_config(cls, config):
         return cls(**config)
@@ -59,7 +66,31 @@ class Sampling(Layer):
         dim = ops.shape(z_mean)[1]
         epsilon = keras.random.normal(shape=(batch,dim), seed=self.seed_generator)
         epsilon = tf.cast(epsilon, dtype=z_mean.dtype)
-        return z_mean + tf.exp(0.5 * z_log_var) * epsilon
+        z = z_mean + tf.exp(0.5 * z_log_var) * epsilon
+        # add noise regularization
+        #noise = tf.keras.backend.random_normal(shape=tf.shape(z), mean=0.0, stddev=0.01, dtype=z_mean.dtype)
+        #z += noise
+        return z
+
+
+class BoolMask(Layer):
+    """
+    Custom layer for boolean masking in encoder
+    """
+    def __init__(self, **kwargs):
+        super(BoolMask, self).__init__(**kwargs)
+
+    def call(self, inputs): 
+        x, mask = inputs
+        mask = tf.cast(mask, dtype=tf.bool)
+        nonzero_voxels = tf.boolean_mask(x, mask)
+        return nonzero_voxels
+
+    def compute_output_shape(self, input_shape):
+        return (None,22,27,22,128)
+
+    #def compute_output_spec(self, input_signature):
+    #    return tf.TensorSpec(shape=(None,), dtype=input_signature[0].dtype)
 
 
 class KLAnnealing(Callback):
@@ -124,6 +155,7 @@ class VAE(Model):
         self.batch_size = batch_size
         self.history = None
         self.mask_file = os.path.join(os.getcwd(), 'atlases', 'MNI152_T1_1mm_mask.nii.gz')
+        self.ds_mask_file = os.path.join(os.getcwd(), 'atlases', 'ds_mask.nii.gz')
         # set architecture parameters
         self.activation = 'relu'
         self.strides = (2,2,2)
@@ -137,15 +169,15 @@ class VAE(Model):
         self.total_loss_tracker = keras.metrics.Mean(name='total_loss')
         self.recon_loss_tracker = keras.metrics.Mean(name='recon_loss')
         self.kl_loss_tracker = keras.metrics.Mean(name='kl_loss')
+        self.grad_penalty_tracker = keras.metrics.Mean(name='gradient_penalty_loss')
         lr_sched = tf.keras.optimizers.schedules.ExponentialDecay(initial_learning_rate=self.lr, decay_steps=1000, decay_rate=0.9)
         opt0 = tf.keras.optimizers.Adam(learning_rate=lr_sched, clipnorm=1.0)
         opt1 = tf.keras.optimizers.Adam(learning_rate=lr_sched)
-        opt2 = tf.keras.optimizers.RMSprop(learning_rate=lr_sched)
         self.opt = tf.keras.mixed_precision.LossScaleOptimizer(opt1)
 
     @property
     def metrics(self):
-        return [self.total_loss_tracker, self.recon_loss_tracker, self.kl_loss_tracker]
+        return [self.total_loss_tracker, self.recon_loss_tracker, self.kl_loss_tracker, self.grad_penalty_tracker]
     
     def get_mask(self):
         """Load brain mask and convert to tensor"""
@@ -155,19 +187,38 @@ class VAE(Model):
         mask = tf.constant(mask, dtype=tf.float16)
         return mask
     
-    def get_weight_map(self, fg_weight=5.0, bg_weight=0.01):
+    def get_weight_map(self, fg_weight=1.0, bg_weight=0.01):
         """Create weight map from brain mask"""
         mask = self.get_mask()
         weight_map = tf.where(tf.equal(mask, 1), fg_weight, bg_weight)
         weight_map = tf.cast(weight_map, dtype=tf.float16)
         return weight_map
     
-    def expand_for_batch(self, array):
-        exp_array = tf.expand_dims(array, axis=-1)
-        exp_array = tf.tile(tf.expand_dims(exp_array, axis=0), [self.batch_size,1,1,1,1])
+    def expand_feature_dim(self, array, match_fmap=False):
+        if match_fmap:
+            exp_array = tf.tile(tf.expand_dims(array, axis=-1), [1,1,1,self.fmap_size])
+        else:
+            exp_array = tf.expand_dims(array, axis=-1)
+        return exp_array
+    
+    def expand_for_batch(self, array, expand_feature_dim):
+        if expand_feature_dim:
+            array = self.expand_feature_dim(array, match_fmap=True)
+        exp_array = tf.tile(tf.expand_dims(array, axis=0), [self.batch_size,1,1,1,1])
         exp_array = tf.cast(exp_array, dtype=tf.float16)
         return exp_array
     
+    def get_shape_before_flatten(self, include_feature_dim):
+        if include_feature_dim:
+            return (self.input_shape[0]//self.factor,
+                    self.input_shape[1]//self.factor,
+                    self.input_shape[2]//self.factor,
+                    self.filters[-1])
+        else:
+            return (self.input_shape[0]//self.factor,
+                    self.input_shape[1]//self.factor,
+                    self.input_shape[2]//self.factor)
+
     def build(self):
         self.compile(loss=self.loss_fn, optimizer=self.opt, metrics=self.metrics)
     
@@ -181,36 +232,35 @@ class VAE(Model):
         recon = self.decoder(z)
         return recon
     
-    def track_metrics(self, total_loss, recon_loss, kl_loss):
+    def track_metrics(self, total_loss, recon_loss, kl_loss, gradient_penalty):
         self.total_loss_tracker.update_state(total_loss)
         self.recon_loss_tracker.update_state(recon_loss)
         self.kl_loss_tracker.update_state(kl_loss)
+        self.grad_penalty_tracker.update_state(gradient_penalty)
     
     @tf.function
     def train_step(self, inputs):
         inputs = inputs[0]
-        mask = self.get_mask()
         weight_map = self.get_weight_map()
-        exp_weight_map = self.expand_for_batch(weight_map)
+        exp_weight_map = self.expand_for_batch(weight_map, expand_feature_dim=True)
         with tf.GradientTape() as tape:
             z_mean, z_log_var, z = self.encoder(inputs)
             recon = self.decoder(z)
-            total_loss, recon_loss, kl_loss = self.loss_fn(inputs, recon, z_mean, z_log_var, exp_weight_map)
+            total_loss, recon_loss, kl_loss, grad_penalty = self.loss_fn(inputs, recon, z_mean, z_log_var, exp_weight_map)
         grads = tape.gradient(total_loss, self.trainable_weights)
         self.opt.apply_gradients(zip(grads, self.trainable_weights))
-        self.track_metrics(total_loss, recon_loss, kl_loss)
+        self.track_metrics(total_loss, recon_loss, kl_loss, grad_penalty)
         return {m.name: m.result() for m in self.metrics}
 
     @tf.function
     def test_step(self, inputs):
         inputs = inputs[0]
-        mask = self.get_mask()
         weight_map = self.get_weight_map()
-        exp_weight_map = self.expand_for_batch(weight_map)
+        exp_weight_map = self.expand_for_batch(weight_map, expand_feature_dim=True)
         z_mean, z_log_var, z = self.encoder(inputs)
         recon = self.decoder(z)
-        total_loss, recon_loss, kl_loss = self.loss_fn(inputs, recon, z_mean, z_log_var, exp_weight_map)
-        self.track_metrics(total_loss, recon_loss, kl_loss)
+        total_loss, recon_loss, kl_loss, grad_penalty = self.loss_fn(inputs, recon, z_mean, z_log_var, exp_weight_map)
+        self.track_metrics(total_loss, recon_loss, kl_loss, grad_penalty)
         return {m.name: m.result() for m in self.metrics}
 
     def fit(self, *args, **kwargs):
@@ -218,6 +268,25 @@ class VAE(Model):
         self.verbose = kwargs.get('verbose', 1)
         self.history = super(VAE, self).fit(*args, **kwargs)
         return self.history
+    
+    def custom_fit(self, model, train_data, val_data, epochs, callbacks, verbose=1):
+        """Add progress bar to custom training loop"""
+        for epoch in range(epochs):
+            print(f'Epoch {epoch+1}/{epochs}')
+            progbar = Progbar(target=len(train_data), stateful_metrics=['loss'])
+            for step, x_batch_train in enumerate(train_data):
+                result = model.train_step(x_batch_train)
+                progbar.update(step+1, values=[('loss', result['loss'])])
+            for callback in callbacks:
+                callback.on_epoch_end(epoch, logs=result)
+            val_progbar = Progbar(target=len(val_data), stateful_metrics=['val_loss']) 
+            for val_step, x_batch_val in enumerate(val_data):
+                val_result = model.test_step(x_batch_val)
+                val_progbar.update(val_step+1, values=['val_loss', val_result['loss']])
+            print(f'Training loss: {result["loss"]:.4f}')
+            print(f'Validation loss: {val_result["loss"]:.4f}')
+            for callback in callbacks:
+                callback.on_epoch_end(epoch, logs=val_result)
     
     def create_variational_encoder(self):
         inputs = Input(shape = self.input_shape)
@@ -228,6 +297,11 @@ class VAE(Model):
                 activation=self.activation, padding='same', kernel_initializer='he_normal')(x)
         x = Conv3D(filters=self.filters[2], kernel_size=(3,3,3), strides=self.strides,
                 activation=self.activation, padding='valid', kernel_initializer='he_normal')(x)
+        # try applying resampled mask to force encoder outputs in foreground
+        ds_mask = nib.load(self.ds_mask_file).get_fdata()
+        exp_ds_mask = self.expand_for_batch(ds_mask, expand_feature_dim=True)
+        x = x * exp_ds_mask
+        x = BoolMask()([x, exp_ds_mask])
         x = Flatten()(x)
         z_mean = Dense(self.fmap_size, name='z_mean', kernel_initializer='he_normal')(x)
         z_log_var = Dense(self.fmap_size, name='z_log_var', kernel_initializer='he_normal')(x)
@@ -236,10 +310,7 @@ class VAE(Model):
         return encoder
 
     def create_variational_decoder(self):
-        shape_before_flatten = (self.input_shape[0]//self.factor,
-                                self.input_shape[1]//self.factor,
-                                self.input_shape[2]//self.factor,
-                                self.filters[-1])
+        shape_before_flatten = self.get_shape_before_flatten(include_feature_dim=True)
         decoder_input = Input(shape=(self.fmap_size,))
         x = Dense(np.prod(shape_before_flatten), activation=self.activation)(decoder_input)
         x = Reshape(target_shape=shape_before_flatten)(x)

@@ -14,7 +14,7 @@ from tensorflow.keras.callbacks import EarlyStopping, CallbackList
 from antspynet.architectures import create_convolutional_autoencoder_model_3d
 
 # LOCAL IMPORTS
-from variational import VariationalLoss, Sampling, VAE, KLAnnealing, LatentSpaceVarMonitoring
+from variational import VariationalLoss, Sampling, BoolMask, VAE, KLAnnealing, LatentSpaceVarMonitoring
 from probabalisticVAE import ProbVAE
 from utils import exceptions
 
@@ -148,12 +148,12 @@ class AutoencoderTransfer():
                 vae.decoder.layers[i].set_weights(dec_layers[i].get_weights())
     
     def train_model(self, model):
-        kl_anneal = KLAnnealing(model, self.val_data, 0, 0.5, 30, 10, verbose=1)
+        kl_anneal = KLAnnealing(model, self.val_data, 0, 1, 20, 0, verbose=1)
         var_monitor = LatentSpaceVarMonitoring(model, self.val_data, 1e-4, 0.1, 0)
-        early_stop = EarlyStopping(monitor='total_loss', verbose=1, patience=5, start_from_epoch=20, mode='min')
-        #cbs = CallbackList([kl_anneal, early_stop])
-        #cbs.set_model(model)
-        history = model.fit(self.train_data, validation_data=self.val_data, epochs=self.epochs, verbose=1, callbacks=early_stop)
+        early_stop = EarlyStopping(monitor='total_loss', verbose=1, patience=5, start_from_epoch=25, mode='min')
+        cbs = CallbackList([kl_anneal, early_stop])
+        cbs.set_model(model)
+        history = model.fit(self.train_data, validation_data=self.val_data, epochs=self.epochs, verbose=1, callbacks=cbs)
         return history
 
     def test_model(self, model):
@@ -165,6 +165,7 @@ class AutoencoderTransfer():
     def load_vae_from_file(self, filepath):
         objs = {'VAE': VAE,
                 'Sampling': Sampling,
+                'BoolMask': BoolMask,
                 'VariationalLoss': VariationalLoss,
                 'KLAnnealing': KLAnnealing,
                 'LatentSpaceVarMonitoring': LatentSpaceVarMonitoring}
@@ -180,7 +181,7 @@ class AutoencoderTransfer():
         idx_2_3 = 2 * depth//3
         return [image[:,:,idx_1_3], image[:,:,idx_1_2], image[:,:,idx_2_3]]
     
-    def plot_orig_and_recon(self, autoencoder, n_samples, filepath):
+    def plot_imgs_orig_recon(self, autoencoder, n_samples, filepath):
         # get sample of reconstructed images
         orig_images = self.test_data.get_random_sample(n_samples)
         recon_images = autoencoder.predict(orig_images)
@@ -208,13 +209,31 @@ class AutoencoderTransfer():
         plt.tight_layout(rect=[0,0,1,0.95])
         plt.savefig(filepath)
 
+    def plot_hists_orig_recon(self, autoencoder, n_samples, filepath, nbins):    
+        # get sample of reconstructed images
+        orig_images = self.test_data.get_random_sample(n_samples)
+        recon_images = autoencoder.predict(orig_images)
+        # plot histograms of original and reconstructed side by side
+        fig, axes = plt.subplots(n_samples, 2, figsize=(15, n_samples))
+        for i in range(n_samples):
+            orig_hist, orig_bin_edges = np.histogram(orig_images[i], bins=nbins, range=(0,1))
+            axes[i,0].plot(orig_bin_edges[0:-1], orig_hist)
+            recon_hist, recon_bin_edges = np.histogram(recon_images[i], bins=nbins, range=(0,1))
+            axes[i,1].plot(recon_bin_edges[0:-1], recon_hist)
+        # overall titles
+        fig.text(0.25, 0.96, 'Original histograms', ha='center', fontsize=16)
+        fig.text(0.75, 0.96, 'Reconstructed histograms', ha='center', fontsize=16)
+        plt.tight_layout(rect=[0,0,1,0.95])
+        plt.savefig(filepath)
+
 
 if __name__ == '__main__':
     gc.collect()
     tf.keras.backend.clear_session()
     cae_filepath = os.path.join(os.getcwd(), 'saved_models', 'CAE_CN_ABneg', 'fmap128_epochs100.keras')
-    vae_filepath = os.path.join(os.getcwd(), 'saved_models', 'transferCAE_VAE', 'fmap128_epochs50_noclip_scale.keras')
-    vis_filepath = os.path.join(os.getcwd(), 'transfer_vae_img_recon_fmap128_epochs50_noclip_scale.png')
+    vae_filepath = os.path.join(os.getcwd(), 'saved_models', 'transferCAE_VAE', 'fmap128_epochs50_mask.keras')
+    viz_filepath = os.path.join(os.getcwd(), 'transfer_vae_fmap128_epochs50_mask.png')
+    hist_filepath = os.path.join(os.getcwd(), 'transfer_vae_fmap128_epochs50_mask_hists.png')
     transfer_model = AutoencoderTransfer(batch_size=10, epochs=50, fmap_size=128)
     cae = transfer_model.load_cae_from_file(cae_filepath)
     vae = transfer_model.build_vae()
@@ -225,5 +244,6 @@ if __name__ == '__main__':
     transfer_model.test_model(vae)
     transfer_model.save_model_to_file(vae, filepath=vae_filepath)
     #vae = transfer_model.load_vae_from_file(vae_filepath)
-    transfer_model.plot_orig_and_recon(vae, n_samples=10, filepath=vis_filepath)
+    transfer_model.plot_imgs_orig_recon(vae, n_samples=10, filepath=viz_filepath)
+    transfer_model.plot_hists_orig_recon(vae, n_samples=10, filepath=hist_filepath, nbins=128)
 
