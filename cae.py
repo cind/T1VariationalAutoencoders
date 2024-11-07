@@ -27,10 +27,10 @@ class DataGenerator(Sequence):
     def __init__(self, batch_size, mode, shuffle=True):
         super(DataGenerator, self).__init__()
         self.base_dir = os.getcwd()
-        self.input_data_dir = os.path.join(self.base_dir, 'data', 'CN_ABneg')
+        self.input_data_dir = os.path.join(self.base_dir, 'data')
         self.train_data_dir = os.path.join(self.input_data_dir, 'training')
         self.test_data_dir = os.path.join(self.input_data_dir, 'testing')
-        #self.holdout_data_dir = os.path.join(self.input_data_dir, 'holdout')
+        self.val_data_dir = os.path.join(self.input_data_dir, 'validation')
         self.mode = mode
         self.data_shape = (180, 220, 180, 1)
         self.batch_size = batch_size
@@ -49,6 +49,8 @@ class DataGenerator(Sequence):
             imgs = os.listdir(self.train_data_dir)
         elif self.mode == 'testing':
             imgs = os.listdir(self.test_data_dir)
+        elif self.mode == 'validation':
+            imgs = os.listdir(self.val_data_dir)
         return imgs
     
     def __getitem__(self, index):
@@ -79,7 +81,7 @@ class DataGenerator(Sequence):
         x = np.empty((n_samples, *self.data_shape))
         for i, idx in enumerate(indices):
             item = test_data[idx]
-            item = os.path.join(os.getcwd(), 'data', 'CN_ABneg', 'testing', item)
+            item = os.path.join(os.getcwd(), 'data', 'testing', item)
             img = nib.load(item)
             data = img.get_fdata() 
             # resize from (182,218,182) --> (180,220,180) for network compatibility
@@ -130,12 +132,13 @@ class T1CAEModel():
 
     def train_model(self, model, save=False):
         train_generator = DataGenerator(batch_size=self.batch_size, mode='training')
+        val_generator = DataGenerator(batch_size=self.batch_size, mode='validation')
         cb = EarlyStopping(monitor='loss', verbose=1, patience=5, start_from_epoch=15)
         if save:
-            train_history = model.fit(train_generator, epochs=self.epochs, callbacks=cb)
+            train_history = model.fit(train_generator, validation_data=val_generator, epochs=self.epochs, callbacks=cb)
             return train_history
         else:
-            model.fit(train_generator, epochs=self.epochs, callbacks=cb)
+            model.fit(train_generator, validation_data=val_generator, epochs=self.epochs, callbacks=cb)
 
     def test_model(self, model):
         test_generator = DataGenerator(batch_size=self.batch_size, mode='testing')
@@ -182,9 +185,9 @@ class T1CAEModel():
 
 if __name__ == '__main__':
     gc.collect()
-    model_filepath = os.path.join(os.getcwd(), 'saved_models', 'cae_fmap128_100epochs_ctrldata.keras')
-    vis_filepath = os.path.join(os.getcwd(), 'cae_img_recon_fmap128_100epochs_ctrldata.png')
-    t1cae_model = T1CAEModel(batch_size=13, epochs=100, fmap_size=128)
+    model_filepath = os.path.join(os.getcwd(), 'saved_models', 'cae_fmap10_alldata.keras')
+    vis_filepath = os.path.join(os.getcwd(), 'cae_fmap10_alldata.png')
+    t1cae_model = T1CAEModel(batch_size=13, epochs=100, fmap_size=10)
     model = t1cae_model.build_model()
     print(model.summary())
     t1cae_model.train_model(model)

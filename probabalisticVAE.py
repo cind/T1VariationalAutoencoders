@@ -2,23 +2,26 @@ import math
 import gc
 import numpy as np
 import tensorflow as tf
-#import tensorflow_probability as tfp
+import tensorflow_probability as tfp
 from tensorflow import keras
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Layer, Input, Conv3D, Conv3DTranspose, Dense, Flatten, Reshape
 from tensorflow.keras.optimizers import Adam, schedules
 
 # Probabalistic variational autoencoder module using tensorflow-probability
+tfd = tfp.distributions
+tfpl = tfp.layers
 
 
 class ProbVAE(Model):
     """
     Variational autoencoder model
     """
-    def __init__(self, input_shape, fmap_size, kl_weight, **kwargs):
+    def __init__(self, input_shape, fmap_size, kl_weight, batch_size, **kwargs):
         super(ProbVAE, self).__init__(**kwargs)
         self.input_shape = input_shape
         self.fmap_size = fmap_size
+        self.batch_size = batch_size
         self.kl_weight = tf.Variable(kl_weight, trainable=False, dtype=tf.float32)
         self.total_loss_tracker = keras.metrics.Mean(name='total_loss')
         # architecture parameters
@@ -37,13 +40,14 @@ class ProbVAE(Model):
     def reparameterize(self, mean, logvar):
         batchsize = keras.ops.shape(mean)[0]
         eps = tf.random.normal(shape=(batchsize, self.fmap_size))
-        eps = tf.cast(eps, dtype=tf.float32)
+        eps = tf.cast(eps, dtype=tf.float16)
         return eps * tf.exp(0.5 * logvar) + mean
 
     def log_normal_pdf(self, sample, mean, logvar, raxis=1):
-        log2pi = tf.math.log(2.0*np.pi)
+        log2pi = tf.cast(tf.math.log(2.0*np.pi), dtype=tf.float16)
         sq_diff = (sample - mean) ** 2
         elogvar = tf.exp(-logvar)
+        elogvar = tf.cast(elogvar, dtype=tf.float16)
         rslt = tf.reduce_sum(-0.5 * (sq_diff * elogvar + logvar + log2pi), axis=raxis)
         return rslt
     
@@ -55,7 +59,7 @@ class ProbVAE(Model):
         log(p(z)): prior distribution on latent space
         log(q(z|x)): encoder distribution
         """
-        data = tf.cast(data, dtype=tf.float32)
+        data = tf.cast(data, dtype=tf.float16)
         logpx_z = tf.reduce_mean(tf.square(data - recon))
         logpz = self.log_normal_pdf(z, 0.0, 0.0)
         logqz_x = self.log_normal_pdf(z, z_mean, z_logvar)
@@ -94,27 +98,27 @@ class ProbVAE(Model):
     def build(self):
         self.compile(optimizer=self.opt, metrics=self.metrics)
     
-    #@tf.function
-    def train_step(self, data):
+    @tf.function
+    def train_step(self, inputs):
         """
         Executes one training step and returns loss.
         """
-        data = data[0]
+        inputs = inputs[0]
         with tf.GradientTape() as tape:
-            recon, z, z_mean, z_logvar = self.forward_pass(data)
-            loss = self.compute_loss(data, recon, z, z_mean, z_logvar)
+            recon, z, z_mean, z_logvar = self.forward_pass(inputs)
+            loss = self.compute_loss(inputs, recon, z, z_mean, z_logvar)
         grads = tape.gradient(loss, self.trainable_weights)
         self.opt.apply_gradients(zip(grads, self.trainable_weights))
         return loss
     
     @tf.function
-    def test_step(self, data):
-        data = data[0]
-        recon, z, z_mean, z_logvar = self.forward_pass(data)
-        loss = self.compute_loss(data, recon, z, z_mean, z_logvar)
+    def test_step(self, inputs):
+        inputs = inputs[0]
+        recon, z, z_mean, z_logvar = self.forward_pass(inputs)
+        loss = self.compute_loss(inputs, recon, z, z_mean, z_logvar)
         return loss
     
-    def create_variational_encoder(self):
+    def create_encoder(self):
         inputs = Input(shape = self.input_shape)
         x = inputs
         x = Conv3D(filters=self.filters[0], kernel_size=(5,5,5), strides=self.strides, 
@@ -129,7 +133,7 @@ class ProbVAE(Model):
         encoder = Model(inputs, [z_mean, z_log_var], name='encoder')
         return encoder
 
-    def create_variational_decoder(self):
+    def create_decoder(self):
         shape_before_flatten = (self.input_shape[0]//self.factor,
                                 self.input_shape[1]//self.factor,
                                 self.input_shape[2]//self.factor,
@@ -146,6 +150,8 @@ class ProbVAE(Model):
         decoder = Model(decoder_input, outputs, name='decoder')
         return decoder
 
+    #def create_
+    
     @property
     def metrics(self):
         return [self.total_loss_tracker]

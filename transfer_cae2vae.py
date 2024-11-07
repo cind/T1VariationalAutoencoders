@@ -11,11 +11,10 @@ from tensorflow.keras import Model
 from tensorflow.keras.utils import Sequence
 from tensorflow.keras.models import load_model, save_model
 from tensorflow.keras.callbacks import EarlyStopping, CallbackList
-from antspynet.architectures import create_convolutional_autoencoder_model_3d
 
 # LOCAL IMPORTS
-from variational import VariationalLoss, Sampling, BoolMask, VAE, KLAnnealing, LatentSpaceVarMonitoring
-from probabalisticVAE import ProbVAE
+from variational import VariationalLoss, Sampling, VAE, KLAnnealing
+#from probabalisticVAE import ProbVAE
 from utils import exceptions
 
 logger = logging.getLogger(__name__)
@@ -131,26 +130,24 @@ class AutoencoderTransfer():
     def build_vae(self):
         """Builds/compiles VAE"""
         vae = VAE(input_shape=self.input_shape, fmap_size=self.fmap_size, kl_weight=1.0, batch_size=self.batch_size)
+        #vae = ProbVAE(input_shape=self.input_shape, fmap_size=self.fmap_size, kl_weight=1.0, batch_size=self.batch_size)
         vae.build()
         return vae
      
     def transfer_weights_fromCAE(self, cae, vae):
         """Transfers weights from each CAE layer to each VAE layer where applicable"""
         enc_layers = cae.layers[:5]
-        bottleneck_layer = cae.layers[5]
         dec_layers = cae.layers[5:]
         for i in range(len(vae.encoder.layers)):
             if i < len(enc_layers):
                 vae.encoder.layers[i].set_weights(enc_layers[i].get_weights())
-        #vae.encoder.layers[5].set_weights(bottleneck_layer.get_weights())
         for i in range(len(vae.decoder.layers)):
             if i < len(dec_layers) and i > 0:
                 vae.decoder.layers[i].set_weights(dec_layers[i].get_weights())
     
     def train_model(self, model):
-        kl_anneal = KLAnnealing(model, self.val_data, 0, 1, 20, 0, verbose=1)
-        var_monitor = LatentSpaceVarMonitoring(model, self.val_data, 1e-4, 0.1, 0)
-        early_stop = EarlyStopping(monitor='total_loss', verbose=1, patience=5, start_from_epoch=25, mode='min')
+        kl_anneal = KLAnnealing(model, self.val_data, 0, 10, 25, 0, verbose=1)
+        early_stop = EarlyStopping(monitor='total_loss', verbose=1, patience=5, start_from_epoch=15, mode='min')
         cbs = CallbackList([kl_anneal, early_stop])
         cbs.set_model(model)
         history = model.fit(self.train_data, validation_data=self.val_data, epochs=self.epochs, verbose=1, callbacks=cbs)
@@ -165,10 +162,8 @@ class AutoencoderTransfer():
     def load_vae_from_file(self, filepath):
         objs = {'VAE': VAE,
                 'Sampling': Sampling,
-                'BoolMask': BoolMask,
                 'VariationalLoss': VariationalLoss,
-                'KLAnnealing': KLAnnealing,
-                'LatentSpaceVarMonitoring': LatentSpaceVarMonitoring}
+                'KLAnnealing': KLAnnealing}
         return load_model(filepath, custom_objects=objs, compile=True)
     
     def save_model_to_file(self, model, filepath):
@@ -230,11 +225,12 @@ class AutoencoderTransfer():
 if __name__ == '__main__':
     gc.collect()
     tf.keras.backend.clear_session()
-    cae_filepath = os.path.join(os.getcwd(), 'saved_models', 'CAE_CN_ABneg', 'fmap128_epochs100.keras')
-    vae_filepath = os.path.join(os.getcwd(), 'saved_models', 'transferCAE_VAE', 'fmap128_epochs50_mask.keras')
-    viz_filepath = os.path.join(os.getcwd(), 'transfer_vae_fmap128_epochs50_mask.png')
-    hist_filepath = os.path.join(os.getcwd(), 'transfer_vae_fmap128_epochs50_mask_hists.png')
-    transfer_model = AutoencoderTransfer(batch_size=10, epochs=50, fmap_size=128)
+    #cae_filepath = os.path.join(os.getcwd(), 'saved_models', 'CAE_CN_ABneg', 'fmap128_epochs100.keras')
+    cae_filepath = os.path.join(os.getcwd(), 'saved_models', 'CAE_all', 'cae_fmap10_alldata.keras')
+    vae_filepath = os.path.join(os.getcwd(), 'saved_models', 'transferCAE_VAE', 'fmap10_epochs50.keras')
+    viz_filepath = os.path.join(os.getcwd(), 'fmap10_epochs50.png')
+    hist_filepath = os.path.join(os.getcwd(), 'fmap10_epochs50_hists.png')
+    transfer_model = AutoencoderTransfer(batch_size=10, epochs=50, fmap_size=10)
     cae = transfer_model.load_cae_from_file(cae_filepath)
     vae = transfer_model.build_vae()
     transfer_model.transfer_weights_fromCAE(cae, vae)
@@ -245,5 +241,5 @@ if __name__ == '__main__':
     transfer_model.save_model_to_file(vae, filepath=vae_filepath)
     #vae = transfer_model.load_vae_from_file(vae_filepath)
     transfer_model.plot_imgs_orig_recon(vae, n_samples=10, filepath=viz_filepath)
-    transfer_model.plot_hists_orig_recon(vae, n_samples=10, filepath=hist_filepath, nbins=128)
+    transfer_model.plot_hists_orig_recon(vae, n_samples=10, filepath=hist_filepath, nbins=20)
 

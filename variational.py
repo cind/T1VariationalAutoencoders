@@ -5,12 +5,20 @@ import tensorflow as tf
 from tensorflow import keras
 from keras import ops
 from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Layer, Input, Conv3D, Conv3DTranspose, Dense, Flatten, Reshape
+from tensorflow.keras.layers import Layer, Input, Conv3D, Conv3DTranspose, Dense, Flatten, Reshape, Dropout, SpatialDropout3D
 from tensorflow.keras.losses import Loss, MeanSquaredError
 from tensorflow.keras.callbacks import Callback
 from tensorflow.keras.utils import register_keras_serializable, Progbar
 
 logger = logging.getLogger(__name__)
+
+# structural similarity index and peak signal to noise ratio as additional reconstruction measures
+
+def compute_ssim(img1, img2):
+    return tf.reduce_mean(tf.image.ssim(img1, img2, max_val=1.0))
+
+def compute_psnr(img1, img2):
+    return tf.reduce_mean(tf.image.psnr(img1, img2, max_val=1.0))
 
 
 @register_keras_serializable(package='variational')
@@ -21,21 +29,29 @@ class VariationalLoss(Loss):
     """
     def __init__(self, kl_weight, name='variational_loss', reduction=tf.keras.losses.Reduction.SUM_OVER_BATCH_SIZE):
         super().__init__(name=name, reduction=reduction)
-        self.recon_loss_fn = MeanSquaredError()
+        self.mse = MeanSquaredError()
         self.kl_weight = kl_weight
 
     def get_config(self):
         config = super(VariationalLoss, self).get_config()
         return config
     
-    def __call__(self, inputs, recon, z_mean, z_log_var, weight_map):
-        recon_loss = tf.cast(self.recon_loss_fn(inputs, recon), dtype=tf.float16)
-        #recon_loss = weight_map * recon_loss
+    def __call__(self, inputs, recon, z_mean, z_log_var, weight_map=None):
+        recon_weight = 100
+        #ssim_weight = 0.5
+        #psnr_weight = 0.1
+        inputs = tf.cast(inputs, dtype=tf.float16)
+        recon_loss = tf.cast(tf.reduce_mean(self.mse(inputs, recon)), dtype=tf.float16)
+        if weight_map:
+            recon_loss = weight_map * recon_loss
         # add gradient penalty
-        gradient_penalty = self.gradient_penalty_loss(inputs, recon)
-        kl_loss = -0.5 * tf.reduce_mean(1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var))
-        total_loss = recon_loss + self.kl_weight * kl_loss + gradient_penalty
-        return total_loss, recon_loss, kl_loss, gradient_penalty
+        #gradient_penalty = self.gradient_penalty_loss(inputs, recon)
+        kl_loss = -0.5 * tf.reduce_sum(1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var), axis=-1)
+        kl_loss = tf.cast(tf.reduce_mean(kl_loss), dtype=tf.float16)
+        #ssim_loss = -tf.cast(compute_ssim(inputs, recon), dtype=tf.float16)
+        #psnr_loss = -tf.cast(compute_psnr(inputs, recon), dtype=tf.float16)
+        total_loss = recon_weight*recon_loss + self.kl_weight*kl_loss
+        return total_loss, recon_loss, kl_loss
 
     def gradient_penalty_loss(self, y_true, y_pred, sample_weight=None):
         """Gradient penalty regularization"""
@@ -56,41 +72,19 @@ class Sampling(Layer):
     Outputs: resampled z --> decoder inputs
     Uses (z_mean, z_log_var) to sample the latent space and generate new z.
     """
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.seed_generator = keras.random.SeedGenerator(666)
+    def __init__(self, regularizer=False, **kwargs):
+        super(Sampling, self).__init__(**kwargs)
+        self.regularizer = regularizer
+        self.seed_generator = keras.random.SeedGenerator(1729)
 
     def call(self, inputs):
         z_mean, z_log_var = inputs
         batch = ops.shape(z_mean)[0]
         dim = ops.shape(z_mean)[1]
         epsilon = keras.random.normal(shape=(batch,dim), seed=self.seed_generator)
-        epsilon = tf.cast(epsilon, dtype=z_mean.dtype)
+        epsilon = tf.cast(epsilon**2, dtype=z_mean.dtype)
         z = z_mean + tf.exp(0.5 * z_log_var) * epsilon
-        # add noise regularization
-        #noise = tf.keras.backend.random_normal(shape=tf.shape(z), mean=0.0, stddev=0.01, dtype=z_mean.dtype)
-        #z += noise
         return z
-
-
-class BoolMask(Layer):
-    """
-    Custom layer for boolean masking in encoder
-    """
-    def __init__(self, **kwargs):
-        super(BoolMask, self).__init__(**kwargs)
-
-    def call(self, inputs): 
-        x, mask = inputs
-        mask = tf.cast(mask, dtype=tf.bool)
-        nonzero_voxels = tf.boolean_mask(x, mask)
-        return nonzero_voxels
-
-    def compute_output_shape(self, input_shape):
-        return (None,22,27,22,128)
-
-    #def compute_output_spec(self, input_signature):
-    #    return tf.TensorSpec(shape=(None,), dtype=input_signature[0].dtype)
 
 
 class KLAnnealing(Callback):
@@ -105,6 +99,7 @@ class KLAnnealing(Callback):
         self.kl_end = kl_end
         self.annealing_epochs = annealing_epochs
         self.start_epoch = start_epoch
+        self.verbose = verbose
         self.kl_increment = 0.1
         self.kl_schedule = np.linspace(kl_start, kl_end, annealing_epochs)
 
@@ -115,8 +110,13 @@ class KLAnnealing(Callback):
             new_kl_weight = self.kl_end
         else:
             new_kl_weight = self.kl_start
-        self.vae.kl_weight.assign(new_kl_weight)
-        logger.info(f"\nEpoch {epoch+1}: KL weight set to {new_kl_weight}.")
+        if hasattr(self.vae, 'kl_weight'):
+            tf.keras.backend.set_value(self.vae.kl_weight, new_kl_weight)
+        #self.vae.kl_weight.assign(new_kl_weight)
+        print(f"\nEpoch {epoch+1}: KL weight set to {new_kl_weight}.")
+
+    def on_epoch_end(self, epoch, logs=None):
+        pass
 
 
 class LatentSpaceVarMonitoring(Callback):
@@ -167,17 +167,20 @@ class VAE(Model):
         # set loss, metrics, optimizer
         self.loss_fn = VariationalLoss(kl_weight=self.kl_weight)
         self.total_loss_tracker = keras.metrics.Mean(name='total_loss')
-        self.recon_loss_tracker = keras.metrics.Mean(name='recon_loss')
-        self.kl_loss_tracker = keras.metrics.Mean(name='kl_loss')
+        self.recon_loss_tracker = keras.metrics.Mean(name='MSE_loss')
+        self.kl_loss_tracker = keras.metrics.Mean(name='KL_loss')
         self.grad_penalty_tracker = keras.metrics.Mean(name='gradient_penalty_loss')
+        self.ssim_loss_tracker = keras.metrics.Mean(name='SSIM_loss')
+        self.psnr_loss_tracker = keras.metrics.Mean(name='PSNR_loss')
         lr_sched = tf.keras.optimizers.schedules.ExponentialDecay(initial_learning_rate=self.lr, decay_steps=1000, decay_rate=0.9)
         opt0 = tf.keras.optimizers.Adam(learning_rate=lr_sched, clipnorm=1.0)
         opt1 = tf.keras.optimizers.Adam(learning_rate=lr_sched)
-        self.opt = tf.keras.mixed_precision.LossScaleOptimizer(opt1)
+        self.opt = tf.keras.mixed_precision.LossScaleOptimizer(opt0)
 
     @property
     def metrics(self):
-        return [self.total_loss_tracker, self.recon_loss_tracker, self.kl_loss_tracker, self.grad_penalty_tracker]
+        return [self.total_loss_tracker, self.recon_loss_tracker, self.kl_loss_tracker, 
+                self.ssim_loss_tracker, self.psnr_loss_tracker]
     
     def get_mask(self):
         """Load brain mask and convert to tensor"""
@@ -187,7 +190,7 @@ class VAE(Model):
         mask = tf.constant(mask, dtype=tf.float16)
         return mask
     
-    def get_weight_map(self, fg_weight=1.0, bg_weight=0.01):
+    def get_weight_map(self, fg_weight=5.0, bg_weight=1):
         """Create weight map from brain mask"""
         mask = self.get_mask()
         weight_map = tf.where(tf.equal(mask, 1), fg_weight, bg_weight)
@@ -232,11 +235,16 @@ class VAE(Model):
         recon = self.decoder(z)
         return recon
     
-    def track_metrics(self, total_loss, recon_loss, kl_loss, gradient_penalty):
+    def track_metrics(self, total_loss, recon_loss, kl_loss, gradient_penalty=None, ssim_loss=None, psnr_loss=None):
         self.total_loss_tracker.update_state(total_loss)
         self.recon_loss_tracker.update_state(recon_loss)
         self.kl_loss_tracker.update_state(kl_loss)
-        self.grad_penalty_tracker.update_state(gradient_penalty)
+        if gradient_penalty is not None:
+            self.grad_penalty_tracker.update_state(gradient_penalty)
+        if ssim_loss is not None:
+            self.ssim_loss_tracker.update_state(ssim_loss)
+        if psnr_loss is not None:
+            self.psnr_loss_tracker.update_state(psnr_loss)
     
     @tf.function
     def train_step(self, inputs):
@@ -246,10 +254,10 @@ class VAE(Model):
         with tf.GradientTape() as tape:
             z_mean, z_log_var, z = self.encoder(inputs)
             recon = self.decoder(z)
-            total_loss, recon_loss, kl_loss, grad_penalty = self.loss_fn(inputs, recon, z_mean, z_log_var, exp_weight_map)
+            total_loss, recon_loss, kl_loss = self.loss_fn(inputs, recon, z_mean, z_log_var)
         grads = tape.gradient(total_loss, self.trainable_weights)
         self.opt.apply_gradients(zip(grads, self.trainable_weights))
-        self.track_metrics(total_loss, recon_loss, kl_loss, grad_penalty)
+        self.track_metrics(total_loss, recon_loss, kl_loss)
         return {m.name: m.result() for m in self.metrics}
 
     @tf.function
@@ -259,8 +267,8 @@ class VAE(Model):
         exp_weight_map = self.expand_for_batch(weight_map, expand_feature_dim=True)
         z_mean, z_log_var, z = self.encoder(inputs)
         recon = self.decoder(z)
-        total_loss, recon_loss, kl_loss, grad_penalty = self.loss_fn(inputs, recon, z_mean, z_log_var, exp_weight_map)
-        self.track_metrics(total_loss, recon_loss, kl_loss, grad_penalty)
+        total_loss, recon_loss, kl_loss = self.loss_fn(inputs, recon, z_mean, z_log_var)
+        self.track_metrics(total_loss, recon_loss, kl_loss)
         return {m.name: m.result() for m in self.metrics}
 
     def fit(self, *args, **kwargs):
@@ -297,12 +305,9 @@ class VAE(Model):
                 activation=self.activation, padding='same', kernel_initializer='he_normal')(x)
         x = Conv3D(filters=self.filters[2], kernel_size=(3,3,3), strides=self.strides,
                 activation=self.activation, padding='valid', kernel_initializer='he_normal')(x)
-        # try applying resampled mask to force encoder outputs in foreground
-        ds_mask = nib.load(self.ds_mask_file).get_fdata()
-        exp_ds_mask = self.expand_for_batch(ds_mask, expand_feature_dim=True)
-        x = x * exp_ds_mask
-        x = BoolMask()([x, exp_ds_mask])
+        #x = SpatialDropout3D(0.2, data_format='channels_last')(x)
         x = Flatten()(x)
+        x = Dropout(0.2)(x)
         z_mean = Dense(self.fmap_size, name='z_mean', kernel_initializer='he_normal')(x)
         z_log_var = Dense(self.fmap_size, name='z_log_var', kernel_initializer='he_normal')(x)
         z = Sampling()([z_mean, z_log_var])
@@ -327,7 +332,8 @@ class VAE(Model):
         config = super().get_config().copy()
         config.update({'input_shape': self.input_shape,
                        'fmap_size': self.fmap_size,
-                       'kl_weight': self.kl_weight.numpy()})
+                       'kl_weight': self.kl_weight.numpy(),
+                       'batch_size': self.batch_size})
         return config
 
     @classmethod
@@ -335,7 +341,8 @@ class VAE(Model):
         input_shape = config.pop('input_shape')
         fmap_size = config.pop('fmap_size')
         kl_weight = config.pop('kl_weight')
-        return cls(input_shape=input_shape, fmap_size=fmap_size, kl_weight=kl_weight, **config)
+        batch_size = config.pop('batch_size')
+        return cls(input_shape=input_shape, fmap_size=fmap_size, kl_weight=kl_weight, batch_size=batch_size, **config)
 
 
 

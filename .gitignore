@@ -9,5 +9,6 @@ logs/
 __pycache__/
 *.swp
 .nfs*
+*.db
 nohup.out
 notes/
