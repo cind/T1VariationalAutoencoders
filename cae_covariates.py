@@ -14,45 +14,32 @@ logger = logging.getLogger(__name__)
 class DataGenerator(Sequence):
     
     '''Custom data generator to handle 4D batches.'''
-    def __init__(self, batch_size, mode, shuffle=True):
+    def __init__(self, batch_size, shuffle=True):
         super(DataGenerator, self).__init__()
         self.base_dir = os.getcwd()
-        self.input_data_dir = os.path.join(self.base_dir, 'data')
-        self.train_data_dir = os.path.join(self.input_data_dir, 'training')
-        self.test_data_dir = os.path.join(self.input_data_dir, 'testing')
-        self.val_data_dir = os.path.join(self.input_data_dir, 'validation')
-        self.mode = mode
+        self.data_paths = [line.replace('\n','') for line in open('filepaths.txt','r')]
         self.data_shape = (180, 220, 180, 1)
         self.batch_size = batch_size
         self.shuffle = shuffle
-        self.filenames = self.get_imgs_by_mode()
-        self.indexes = list(range(len(self.filenames)))
+        self.indexes = list(range(len(self.data_paths)))
         self.on_epoch_end()
         if self.shuffle:
             random.shuffle(self.indexes)
 
     def __len__(self):
-        return len(self.filenames)//self.batch_size
- 
-    def get_imgs_by_mode(self):
-        if self.mode == 'training':
-            imgs = os.listdir(self.train_data_dir)
-        elif self.mode == 'testing':
-            imgs = os.listdir(self.test_data_dir)
-        elif self.mode == 'validation':
-            imgs = os.listdir(self.val_data_dir)
-        return imgs
+        return len(self.data_paths)//self.batch_size
     
     def __getitem__(self, index):
         # x=y for CAE task
         start_idx = index * self.batch_size
         end_idx = (index+1) * self.batch_size
         batch_indexes = self.indexes[start_idx:end_idx]
-        batch_filenames = [self.filenames[i] for i in batch_indexes]
+        batch_filenames = [self.data_paths[i] for i in batch_indexes]
+        nms = [os.path.basename(self.data_paths[i])[:-7] for i in batch_indexes]
         x = np.empty((len(batch_indexes), *self.data_shape))
-        y = np.empty((len(batch_indexes), *self.data_shape))
+        #y = np.empty((len(batch_indexes), *self.data_shape))
         for i, idx in enumerate(batch_indexes):
-            image = os.path.join(self.input_data_dir, self.mode, batch_filenames[i])
+            image = batch_filenames[i]
             img = nib.load(image)
             data = img.get_fdata()
             # resize from (182,218,182) --> (180,220,180) for network compatibility
@@ -61,6 +48,7 @@ class DataGenerator(Sequence):
             # min-max scale data from range [0,255] --> [0,1] for training stability
             data = data/255
             x[i,:,:,:,0] = data
+        return x, nms
 
 
 class EncodeT1Data:
@@ -74,25 +62,12 @@ class EncodeT1Data:
         self.input_shape = (180, 220, 180, 1)
         self.batch_size = batch_size
         self.cae_model_path = cae_model_path
-        self.data = ABPosDataGenerator(batch_size=self.batch_size)
-        self.ds = self.get_dataset(self.data)
-        self.encoded_data = os.path.join(os.getcwd(), 'data', 'T1BrainMNIdims', 'apos_tau_vector_encoding.csv')
-        self.encoded_data_dir = os.path.join(os.getcwd(), 'data', 'T1BrainMNIdims', 'apos_encoded_data')
+        self.data = DataGenerator(batch_size=self.batch_size)
+        self.encoded_data = os.path.join(os.getcwd(), 'fmap10_T1_vector_encoding.csv')
         # mixed precision for training trades computation time for memory
         policy = tf.keras.mixed_precision.Policy('mixed_float16')
         tf.keras.mixed_precision.set_global_policy(policy)
 
-    def get_dataset(self, data_generator, repeat=False):
-        dataset = tf.data.Dataset.from_generator(
-                lambda: data_generator_wrapper(data_generator),
-                output_types=(tf.float32, tf.float32),
-                output_shapes=(tf.TensorShape([None,180,220,180,1]), tf.TensorShape([None,128])))
-        if repeat:
-            dataset = dataset.repeat(data_generator.__len__()).batch(self.batch_size)
-        else:
-            dataset = dataset.batch(self.batch_size)
-        return dataset
-    
     def get_cae(self):
         cae_model = load_model(self.cae_model_path, compile=True)
         return cae_model
@@ -159,7 +134,7 @@ if __name__=='__main__':
     gc.collect()
     tf.keras.backend.clear_session()
     path = '/m/Researchers/Eliana/T1VariationalAutoencoders/saved_models/CAE_all/cae_fmap10_alldata.keras'
-    tau_encoder = EncodeABPosTauData(batch_size=5, cae_model_path=path)
-    encoded_data = tau_encoder.encode_images()
+    t1encoder = EncodeT1Data(batch_size=5, cae_model_path=path)
+    encoded_data = t1encoder.encode_images()
 
 

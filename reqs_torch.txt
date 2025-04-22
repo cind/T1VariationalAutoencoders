@@ -1,0 +1,12 @@
+wheel
+numpy
+pandas
+nibabel
+matplotlib
+tqdm
+scikit-learn
+antspynet
+torch
+torchmetrics
+torchvision
+monai==0.7.0

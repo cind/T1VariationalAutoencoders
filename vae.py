@@ -13,7 +13,6 @@ from tensorflow.keras.models import load_model, save_model
 
 # LOCAL IMPORTS
 from variational import VariationalLoss, Sampling, VAE, KLAnnealing
-from probabalisticVAE import ProbVAE
 from utils import exceptions
 
 logger = logging.getLogger(__name__)
@@ -27,9 +26,10 @@ class DataGenerator(Sequence):
     def __init__(self, batch_size, mode, shuffle=True):
         super(DataGenerator, self).__init__()
         self.base_dir = os.getcwd()
-        self.input_data_dir = os.path.join(self.base_dir, 'data', 'CN_ABneg')
+        self.input_data_dir = os.path.join(self.base_dir, 'data', 'regtoMNI')
         self.train_data_dir = os.path.join(self.input_data_dir, 'training')
         self.test_data_dir = os.path.join(self.input_data_dir, 'testing')
+        self.val_data_dir = os.path.join(self.input_data_dir, 'validation')
         self.mode = mode
         self.data_shape = (180, 220, 180, 1)
         self.batch_size = batch_size
@@ -48,6 +48,8 @@ class DataGenerator(Sequence):
             imgs = os.listdir(self.train_data_dir)
         elif self.mode == 'testing':
             imgs = os.listdir(self.test_data_dir)
+        elif self.mode == 'validation':
+            imgs = os.listdir(self.val_data_dir)
         return imgs
     
     def __getitem__(self, index):
@@ -77,7 +79,7 @@ class DataGenerator(Sequence):
         x = np.empty((n_samples, *self.data_shape))
         for i, idx in enumerate(indices):
             item = test_data[idx]
-            item = os.path.join(os.getcwd(), 'data', 'CN_ABneg', 'testing', item)
+            item = os.path.join(os.getcwd(), 'data', 'regtoMNI', 'testing', item)
             img = nib.load(item)
             data = img.get_fdata() 
             # resize from (182,218,182) --> (180,220,180) for network compatibility
@@ -107,6 +109,7 @@ class T1VAEModel():
         self.fmap_size = fmap_size
         self.train_data = DataGenerator(batch_size=self.batch_size, mode='training')
         self.test_data = DataGenerator(batch_size=self.batch_size, mode='testing')
+        self.val_data = DataGenerator(batch_size=self.batch_size, mode='validation')
         # mixed precision for training trades computation time for memory
         policy = tf.keras.mixed_precision.Policy('mixed_float16')
         tf.keras.mixed_precision.set_global_policy(policy)
@@ -114,19 +117,19 @@ class T1VAEModel():
     def build_model(self, model_type):
         """Builds/compiles VAE"""
         if model_type == 'vae':
-            vae = VAE(input_shape=self.input_shape, fmap_size=self.fmap_size, kl_weight=1.0)
+            vae = VAE(input_shape=self.input_shape, batch_size=self.batch_size, fmap_size=self.fmap_size, kl_weight=1.0)
         elif model_type == 'prob_vae':
             vae = ProbVAE(input_shape=self.input_shape, fmap_size=self.fmap_size, kl_weight=1.0)
         vae.build()
         return vae
     
     def get_annealer(self, model, startweight, endweight, n_epochs):
-        kl = KLAnnealing(model, kl_start=startweight, kl_end=endweight, annealing_epochs=n_epochs)
+        kl = KLAnnealing(model, kl_start=startweight, kl_end=endweight, annealing_epochs=n_epochs, validation_data=self.val_data)
         return kl
     
     def train_model(self, model):
         kl = self.get_annealer(model, 0.001, 1.0, 20)
-        model.fit(self.train_data, epochs=self.epochs, callbacks=kl)
+        model.fit(self.train_data, validation_data=self.val_data, epochs=self.epochs, callbacks=kl)
 
     def train_and_save_model(self, model, callbacks=None):
         train_history = model.fit(self.train_data, epochs=self.epochs, callbacks=callbacks)
@@ -178,9 +181,9 @@ class T1VAEModel():
 if __name__ == '__main__':
     gc.collect()
     tf.keras.backend.clear_session()
-    model_filepath = os.path.join(os.getcwd(), 'saved_models', 'vae_fmap50_epochs100.keras')
-    vis_filepath = os.path.join(os.getcwd(), 'vae_img_recon_fmap50_epochs100.png')
-    t1vae_model = T1VAEModel(batch_size=13, epochs=100, fmap_size=50)
+    model_filepath = os.path.join(os.getcwd(), 'saved_models', 'vae_adni_fmap128_epochs100.keras')
+    vis_filepath = os.path.join(os.getcwd(), 'vae_img_recon_adni_fmap128_epochs100.png')
+    t1vae_model = T1VAEModel(batch_size=15, epochs=100, fmap_size=128)
     vae = t1vae_model.build_model(model_type='vae')
     #print(vae.summary())
     print(vae.encoder.summary())
@@ -189,5 +192,5 @@ if __name__ == '__main__':
     t1vae_model.train_model(vae)
     t1vae_model.test_model(vae)
     t1vae_model.save_model_to_file(vae, filepath=model_filepath)
-    t1vae_model.plot_orig_and_recon(vae, n_samples=5, filepath=vis_filepath)
+    t1vae_model.plot_orig_and_recon(vae, n_samples=10, filepath=vis_filepath)
 

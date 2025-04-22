@@ -27,7 +27,7 @@ class DataGenerator(Sequence):
     def __init__(self, batch_size, mode, shuffle=True):
         super(DataGenerator, self).__init__()
         self.base_dir = os.getcwd()
-        self.input_data_dir = os.path.join(self.base_dir, 'data')
+        self.input_data_dir = os.path.join(self.base_dir, 'data', 'regtoMNI')
         self.train_data_dir = os.path.join(self.input_data_dir, 'training')
         self.test_data_dir = os.path.join(self.input_data_dir, 'testing')
         self.val_data_dir = os.path.join(self.input_data_dir, 'validation')
@@ -65,11 +65,10 @@ class DataGenerator(Sequence):
             image = os.path.join(self.input_data_dir, self.mode, batch_filenames[i])
             img = nib.load(image)
             data = img.get_fdata()
-            # resize from (182,218,182) --> (180,220,180) for network compatibility
+            # resize from (182,218,182) --> (180,220,180)
             data = np.pad(data, pad_width=((0,0),(1,1),(0,0)), mode='constant', constant_values=0)
             data = data[1:181,:,1:181]
-            # min-max scale data from range [0,255] --> [0,1] for training stability
-            data = data/255
+            #data = data/255
             x[i,:,:,:,0] = data
             y[i,:,:,:,0] = data
         return x, y
@@ -81,14 +80,13 @@ class DataGenerator(Sequence):
         x = np.empty((n_samples, *self.data_shape))
         for i, idx in enumerate(indices):
             item = test_data[idx]
-            item = os.path.join(os.getcwd(), 'data', 'testing', item)
+            item = os.path.join(os.getcwd(), 'data', 'regtoMNI', 'testing', item)
             img = nib.load(item)
             data = img.get_fdata() 
-            # resize from (182,218,182) --> (180,220,180) for network compatibility
+            # resize from (182,218,182) --> (180,220,180)
             data = np.pad(data, pad_width=((0,0),(1,1),(0,0)), mode='constant', constant_values=0)
             data = data[1:181,:,1:181]
-            # min-max scale data from range [0,255] --> [0,1] for training stability
-            data = data/255
+            #data = data/255
             x[i,:,:,:,0] = data
         return x
     
@@ -185,14 +183,14 @@ class T1CAEModel():
 
 if __name__ == '__main__':
     gc.collect()
-    model_filepath = os.path.join(os.getcwd(), 'saved_models', 'cae_fmap10_alldata.keras')
-    vis_filepath = os.path.join(os.getcwd(), 'cae_fmap10_alldata.png')
-    t1cae_model = T1CAEModel(batch_size=13, epochs=100, fmap_size=10)
+    model_filepath = os.path.join(os.getcwd(), 'saved_models', 'cae_fmap128_adni_data.keras')
+    vis_filepath = os.path.join(os.getcwd(), 'cae_fmap128_adni_data.png')
+    t1cae_model = T1CAEModel(batch_size=16, epochs=100, fmap_size=128)
     model = t1cae_model.build_model()
     print(model.summary())
     t1cae_model.train_model(model)
-    t1cae_model.save_model_to_file(model, filepath=model_filepath)
     #model = t1cae_model.load_model_from_file(model_filepath)
     t1cae_model.test_model(model)
+    t1cae_model.save_model_to_file(model, filepath=model_filepath)
     t1cae_model.plot_orig_and_recon(model, n_samples=10, filepath=vis_filepath)
 

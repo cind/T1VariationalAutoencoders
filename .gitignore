@@ -1,5 +1,6 @@
 data/
 temp_data/
+iopaths/
 atlases/
 venv/
 saved_models/
@@ -12,3 +13,4 @@ __pycache__/
 *.db
 nohup.out
 notes/
+model_performance/
