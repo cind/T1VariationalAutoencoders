@@ -13,4 +13,7 @@ __pycache__/
 *.db
 nohup.out
 notes/
+encodings/
+environments/
+model_checkpoints/
 model_performance/
