@@ -6,7 +6,10 @@ import torch
 from monai import transforms
 
 #defining transforms
-transforms_monai = transforms.Compose([transforms.AddChannel(), transforms.ToTensor(),])
+transforms_monai = transforms.Compose([
+                    transforms.ResizeWithPadOrCrop(spatial_size=(180,220,180)), 
+                    transforms.AddChannel(), 
+                    transforms.ToTensor()])
 
 class aedataset(torch.utils.data.Dataset):
     def __init__(self, datafile, transforms=transforms_monai):
@@ -19,14 +22,14 @@ class aedataset(torch.utils.data.Dataset):
             img [torch tensor]: img file normalized 
             mask [torch tensor]: mask excluding background
         """
-        self.unbiased_brain = [line.replace('\n','') for line in open(datafile, 'r')]
+        self.image_list = [line.replace('\n','') for line in open(datafile, 'r')]
         self.transforms = transforms
 
     def __len__(self):
-        return len(self.unbiased_brain)
+        return len(self.image_list)
 
     def __getitem__(self, idxx=int):
-        img = nib.load(self.unbiased_brain[idxx])
+        img = nib.load(self.image_list[idxx])
         img = img.get_fdata()
         mask = img != 0
         img = (img - img[img != 0].mean()) / img[img != 0].std()

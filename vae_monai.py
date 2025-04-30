@@ -7,9 +7,10 @@ import matplotlib.pyplot as plt
 
 # DL imports
 import torch
+from torch import nn
 import torch.utils.checkpoint as cp
 from torch.nn import functional as F
-from torch import nn
+from torch.nn import MSELoss, KLDivLoss
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import (
@@ -20,12 +21,25 @@ from pytorch_lightning.callbacks import (
 from pytorch_lightning.loggers import TensorBoardLogger, CSVLogger
 import monai
 from monai.networks.nets import VarAutoEncoder
+from monai.losses.ssim_loss import SSIMLoss
 
 # local imports
 from dataset import *
 
-def chkpt(module, x):
-    return cp.checkpoint(lambda x: module(x), x)
+# resizes images for loss function computation
+def center_crop_to_shape(tensor, target_shape):
+    assert tensor.ndim == len(target_shape), "input and target must have same number of dims"
+    slices = []
+    for i in range(tensor.ndim):
+        diff = tensor.shape[i] - target_shape[i]
+        if diff == 0:
+            slices.append(slice(None))
+        else:
+            start = diff//2
+            end = start + target_shape[i]
+            slices.append(slice(start, end))
+    return tensor[tuple(slices)]        
+
 
 # Model architecture and forward pass to Pytorch lightning module.
 
@@ -34,7 +48,7 @@ class VAE(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
         self.latent_size = 128
-        self.input_shape = (182, 218, 182)
+        self.input_shape = (1, 182, 218, 182)
         self.dropout_rate = 0.2
         self.kernel_size = 5
         self.channels = (16, 32, 64)
@@ -51,13 +65,14 @@ class VAE(pl.LightningModule):
                 dropout=self.dropout_rate
                 )
     
+        self.loss_func = MSELoss(reduction="sum") + KLDivLoss(reduction="sum")
+
     def setup(self, stage: str):
         if hasattr(self.trainer.strategy, "_set_static_graph"):
             self.trainer.strategy._set_static_graph()
     
     def forward(self, x):
-        x = self.vae_model(x)
-        return x
+        return self.vae_model(x)
     
     # load from checkpoint
     def load_saved_model(self, checkpoint_path):
@@ -70,8 +85,10 @@ class VAE(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         # x, reg_input = batch
         x, mask = batch
-        recon, _ = self(x)
-        loss1 = self.train_loss_function1(x, recon)
+        recon, mu, logvar, z = self(x)
+        if recon.shape != x.shape:
+            recon = center_crop_to_shape(recon, x.shape)
+        loss1 = self.loss_func(x, recon)
         loss1 = loss1.squeeze(1) * mask
         loss1 = loss1.sum()
         loss1 = loss1 / mask.sum()
@@ -83,8 +100,10 @@ class VAE(pl.LightningModule):
     # pytorch lightning validation step
     def validation_step(self, batch, batch_idx):
         x, mask = batch
-        recon, _ = self(x)
-        loss1 = self.valid_loss_function(x, recon)
+        recon, mu, logvar, z = self(x)
+        if recon.shape != x.shape:
+            recon = center_crop_to_shape(recon, x.shape)
+        loss1 = self.loss_func(x, recon)
         loss1 = loss1.squeeze(1) * mask
         loss1 = loss1.sum()
         loss1 = loss1 / mask.sum()
@@ -96,8 +115,10 @@ class VAE(pl.LightningModule):
     # pytorch lightning test step
     def test_step(self, batch, batch_idx):
         x, mask = batch
-        recon, _ = self(x)
-        loss1 = self.valid_loss_function(x, recon)
+        recon, mu, logvar, z = self(x)
+        if recon.shape != x.shape:
+            recon = center_crop_to_shape(recon, x.shape)
+        loss1 = self.loss_func(x, recon)
         loss1 = loss1.squeeze(1) * mask
         loss1 = loss1.sum()
         loss1 = loss1 / mask.sum()
@@ -135,8 +156,10 @@ class VAE(pl.LightningModule):
             x = x.unsqueeze(0).to(device)
             mask = mask.unsqueeze(0).to(device)
             with torch.no_grad():
-                recon, _ = model(x)
+                recon, mu, logvar, z = model(x)
                 x = x * mask
+                if recon.shape != x.shape:
+                    recon = center_crop_to_shape(recon, x.shape)
                 recon = recon * mask
             orig_imgs.append(x.cpu())
             recon_imgs.append(recon.cpu())
@@ -193,7 +216,7 @@ test_dataset = aedataset(datafile="/m/Researchers/Eliana/DeepENDO/training/iopat
 test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=12, pin_memory=True, num_workers=4, shuffle=True)
 
 dir_name = "model_checkpoints"
-model = VAE(0.0005248074602497723)
+model = VAE(0.001)
 lr_monitor = LearningRateMonitor(logging_interval="epoch")
 
 # saving checkpoints monitoring validation loss
@@ -226,15 +249,15 @@ if __name__ == "__main__":
         sync_batchnorm=True,
         log_every_n_steps=20,
         benchmark=True,
-        max_epochs=100,
+        max_epochs=50,
     )
 
     # train model 
     trainer.fit(model, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader)
 
     # load trained model from checkpoint and test
-    '''
-    model_adni = model.load_saved_model(checkpoint_path="model_checkpoint/trainVAE_adni/last.ckpt")
+    
+    model_adni = model.load_saved_model(checkpoint_path="model_checkpoints/last.ckpt")
     print("Evaluating on test data...")
     test_rslt = trainer.test(
         model=model_adni,
@@ -246,4 +269,4 @@ if __name__ == "__main__":
     # plot reconstructions from test data
     title = 'orig_recon_trainVAE_adni.png'
     model_adni.plot_recon(model=model_adni, test_loader=test_dataloader, plot_title=title)
-'''
+
