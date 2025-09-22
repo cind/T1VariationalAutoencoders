@@ -1,6 +1,10 @@
 # imports
 import os, gc, random
+import numpy as np
 import matplotlib.pyplot as plt
+from skimage.metrics import peak_signal_noise_ratio as psnr
+from skimage.metrics import structural_similarity as ssim
+from monai import transforms
 
 # PyTorch
 import torch
@@ -10,7 +14,6 @@ from torch import nn
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 # PyTorch Lightning
-
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import (
     LearningRateMonitor,
@@ -18,19 +21,38 @@ from pytorch_lightning.callbacks import (
     ProgressBar,
     TQDMProgressBar
 )
+from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger, CSVLogger
 
 # Custom imports
 from dataset import *
 
+# compute MSE, MAE, PSNR, SSIM from reconstructed sample
+def compute_metrics(original, recon, mask=None):
+    if isinstance(original, torch.Tensor):
+        original = original.squeeze().cpu().numpy()
+    if isinstance(recon, torch.Tensor):    
+        recon = recon.squeeze().cpu().numpy()
+    if mask is not None:
+        if isinstance(mask, torch.Tensor):
+            mask = mask.squeeze().cpu().numpy()
+        original *= mask
+        recon *= mask
+    mse = np.mean((original - recon) ** 2)
+    mae = np.mean(np.abs(original - recon))
+    psnr_val = psnr(original, recon, data_range=original.max() - original.min())
+    ssim_val = ssim(original, recon, data_range=original.max() - original.min())
+    return mse, mae, psnr_val, ssim_val
+
 # Model architecture and forward pass to Pytorch lightning module.
 
 class engine_AE(pl.LightningModule):
-    def __init__(self, lr):
+    def __init__(self, lr, latent_size=128, dropout_rate=0.2):
         super().__init__()
         self.save_hyperparameters()
-
-        self.hidden_dim = 128  # hidden dimension for latent space used as endophenotype
+        self.latent_size = latent_size
+        self.hidden_dim = latent_size
+        self.dropout_rate = dropout_rate
 
         # defining layers
         # first CNN block
@@ -82,11 +104,10 @@ class engine_AE(pl.LightningModule):
             nn.Conv3d(input_channels, output_channels, kernel_size=3, padding=padding,),
             nn.BatchNorm3d(output_channels),
             nn.LeakyReLU(inplace=True),
-            nn.Conv3d(
-                output_channels, output_channels, kernel_size=3, padding=padding,
-            ),
+            nn.Conv3d(output_channels, output_channels, kernel_size=3, padding=padding),
             nn.BatchNorm3d(output_channels),
             nn.LeakyReLU(inplace=True),
+            nn.Dropout3d(self.dropout_rate),
         )
 
         return encoder
@@ -110,6 +131,7 @@ class engine_AE(pl.LightningModule):
             nn.Conv3d(output_channels, output_channels, kernel_size=3, padding=1),
             nn.BatchNorm3d(output_channels),
             nn.LeakyReLU(inplace=True),
+            nn.Dropout3d(self.dropout_rate),
         )
         return decoder
 
@@ -118,11 +140,10 @@ class engine_AE(pl.LightningModule):
             nn.Conv3d(input_channels, output_channels, kernel_size=3, padding=padding,),
             nn.BatchNorm3d(output_channels),
             nn.LeakyReLU(inplace=True),
-            nn.Conv3d(
-                output_channels, output_channels, kernel_size=3, padding=padding,
-            ),
+            nn.Conv3d(output_channels, output_channels, kernel_size=3, padding=padding),
             nn.BatchNorm3d(output_channels),
             nn.LeakyReLU(inplace=True),
+            nn.Dropout3d(self.dropout_rate),
         )
 
         return cnn_block
@@ -135,6 +156,7 @@ class engine_AE(pl.LightningModule):
             nn.Conv3d(input_channels, input_channels, kernel_size=3, padding=padding),
             nn.BatchNorm3d(input_channels),
             nn.LeakyReLU(inplace=True),
+            nn.Dropout3d(self.dropout_rate),
             nn.Conv3d(input_channels, output_channels, kernel_size=1),
         )
 
@@ -169,10 +191,8 @@ class engine_AE(pl.LightningModule):
         #x = cp.checkpoint(self.fourth_encoder, x)
         shape = x.size()
 
-        # flattening encoder output
-        enc_features = torch.flatten(
-            x, start_dim=1, end_dim=-1
-        )  # to keep batch dimension intact
+        # flattening encoder output to keep batch dimension intact
+        enc_features = torch.flatten(x, start_dim=1, end_dim=-1)
 
         lin1 = self.encoding_mlp(enc_features)  # 1,128
         # Going from hidden dimension to original image recon
@@ -225,6 +245,7 @@ class engine_AE(pl.LightningModule):
     # pytorch lightning test step
     def test_step(self, batch, batch_idx):
         x, mask = batch
+        #x, mask, aff, img_name = batch
         recon, _ = self(x)
         loss1 = self.valid_loss_function(x, recon)
         loss1 = loss1.squeeze(1) * mask
@@ -249,28 +270,41 @@ class engine_AE(pl.LightningModule):
             latents.append(latent.cpu())
         return preds, latents    
     
-    # visualize reconstructed test data
-    def plot_recon(self, model, test_loader, plot_title, device="cuda"):
+    # visualize reconstructed data and output losses
+    def plot_recon(self, model, loader, plot_title, csv_title, device="cuda"):
         model.eval()
         model.to(device)
-        test_dataset = test_loader.dataset
+        test_dataset = loader.dataset
         indices = random.sample(range(len(test_dataset)), 10)
         orig_imgs = []
         recon_imgs = []
+        df = pd.DataFrame(columns=['ImgCode','MSE','MAE','PSNR','SSIM'])
         # reconstruct sample data
         for idx in indices:
-            x, mask = test_dataset[idx]
+            x, mask, img_name = test_dataset[idx]
+            #x, mask = test_dataset[idx]
             mask = (mask > 0.5).float()
             x = x.unsqueeze(0).to(device)
             mask = mask.unsqueeze(0).to(device)
             with torch.no_grad():
+                print(f'reconstructing image {idx}')
                 recon, _ = model(x)
+                #print(x.shape, recon.shape, mask.shape)
                 x = x * mask
                 recon = recon * mask
+                mse, mae, psnr_val, ssim_val = compute_metrics(x, recon, mask)
+                df.loc[len(df)] = [img_name, mse, mae, psnr_val, ssim_val]
+                #print(f"{img_name}: MSE={mse}, MAE={mae}, PSNR={psnr_val}, SSIM={ssim_val}")
             orig_imgs.append(x.cpu())
             recon_imgs.append(recon.cpu())
+            # save orig and recon niftis
+            #orig_nii = nib.Nifti1Image(x.squeeze().cpu().numpy(), aff)
+            #orig_nii.to_filename(f'orig_{img_name}')
+            #recon_nii = nib.Nifti1Image(recon.squeeze().cpu().numpy(), aff)
+            #recon_nii.to_filename(f'recon_{img_name}')
         orig_imgs = torch.cat(orig_imgs, dim=0)
         recon_imgs = torch.cat(recon_imgs, dim=0)
+        df.to_csv(csv_title, index=False)
         # plot orig and recon
         fig, axes = plt.subplots(nrows=10, ncols=6, figsize=(15,25))
         slice_fracs = [0.25, 0.5, 0.75]
@@ -292,8 +326,8 @@ class engine_AE(pl.LightningModule):
         plt.savefig(plot_title)
     
     # pytorch lightning optimizer configuration
-    def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams["lr"])
+    def configure_optimizers(self, weight_decay_rate=1e-5):
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams["lr"], weight_decay=weight_decay_rate)
         lr_scheduler_config = {
             "scheduler": ReduceLROnPlateau(
                 optimizer,
@@ -314,10 +348,21 @@ class engine_AE(pl.LightningModule):
         }
 
         
+#defining transforms
+'''
+transforms_monai = transforms.Compose([
+                    transforms.AddChannel(),
+                    transforms.ResizeWithPadOrCrop(spatial_size=(184,224,184)), 
+                    #transforms.ScaleIntensity(minv=0.0, maxv=1.0),
+                    transforms.ToTensor()])
+'''
+
 # defining train dataset
 train_dataset = aedataset(
-    datafile="/m/Researchers/Eliana/DeepENDO/training/iopaths/train_data.txt", 
+    datafile="/m/Researchers/Eliana/DeepENDO/training/iopaths/adni_dlmuse_normative/train_paths.txt", 
     transforms=transforms_monai,
+    #return_affine=True,
+    #return_img_name=True
 )
 
 # defining train dataloader
@@ -327,8 +372,10 @@ train_dataloader = torch.utils.data.DataLoader(
 
 # defining validation dataset
 val_dataset = aedataset(
-    datafile="/m/Researchers/Eliana/DeepENDO/training/iopaths/val_data.txt",
+    datafile="/m/Researchers/Eliana/DeepENDO/training/iopaths/adni_dlmuse_normative/val_paths.txt",
     transforms=transforms_monai,
+    #return_affine=True,
+    #return_img_name=True
 )
 
 # defining validation dataloader
@@ -338,23 +385,42 @@ val_dataloader = torch.utils.data.DataLoader(
 
 # defining test dataset
 test_dataset = aedataset(
-        datafile="/m/Researchers/Eliana/DeepENDO/training/iopaths/test_data.txt",
-        transforms=transforms_monai
+        datafile="/m/Researchers/Eliana/DeepENDO/training/iopaths/adni_dlmuse_normative/test_paths.txt",
+        transforms=transforms_monai,
+        #return_affine=True,
+        #return_img_name=True
 )
 
 # defining test dataloader
 test_dataloader = torch.utils.data.DataLoader(
-        test_dataset, batch_size=12, pin_memory=True, num_workers=4, shuffle=True
+        test_dataset, batch_size=1, pin_memory=True, num_workers=4, shuffle=True
+)
+'''
+# defining discovery dataset
+disc_dataset = aedataset(
+        datafile="/m/Researchers/Eliana/DeepENDO/training/iopaths/adni_init/discovery_data.txt",
+        transforms=transforms_monai,
+        return_affine=True,
+        return_img_name=True
 )
 
+# defining discovery dataloader
+disc_dataloader = torch.utils.data.DataLoader(
+        disc_dataset, batch_size=12, pin_memory=True, num_workers=4, shuffle=True
+)
+'''
 # directory name to save checkpoints and metrics
-dir_name = "T1_128"
+dir_name = '/m/Researchers/Eliana/DeepENDO/training/T1_128/DLMUSE_ADNI_normative'
 
 # initiaing the model
-AE_model = engine_AE(0.0005248074602497723)
+latent_size = 128
+AE_model = engine_AE(0.0005248074602497723, latent_size)
 
 # learning rate monitor as using scheduler
 lr_monitor = LearningRateMonitor(logging_interval="epoch")
+
+# early stopping
+early_stop = EarlyStopping(monitor='val_loss', mode='min', patience=5)
 
 # saving checkpoints monitoring validation loss
 model_checkpoint = ModelCheckpoint(
@@ -366,8 +432,8 @@ model_checkpoint = ModelCheckpoint(
 )
 
 # Loggers
-tb_logger = TensorBoardLogger(save_dir=dir_name + "/tb_logs")
-csv_logger = CSVLogger(save_dir=dir_name + "/csv_logs")
+#tb_logger = TensorBoardLogger(save_dir=dir_name + "/tb_logs")
+#csv_logger = CSVLogger(save_dir=dir_name + "/csv_logs")
 pb = TQDMProgressBar()
 
 # main training
@@ -376,12 +442,13 @@ if __name__ == "__main__":
     torch.cuda.empty_cache()
     
     trainer = pl.Trainer(
-        logger=[tb_logger, csv_logger],
+        #logger=[tb_logger, csv_logger],
         precision="16-mixed",
         # Change the number of GPUs here
         accelerator="gpu",
         devices=[0, 1, 2, 3],
-        callbacks=[lr_monitor, model_checkpoint, pb],
+        #devices=[0, 1],
+        callbacks=[lr_monitor, model_checkpoint, pb, early_stop],
         strategy="ddp_find_unused_parameters_true",
         detect_anomaly=False,
         sync_batchnorm=True,
@@ -391,22 +458,27 @@ if __name__ == "__main__":
     )
 
     # train model 
-    '''
-    trainer.fit(
-        AE_model, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader
-    )'''
+    trainer.fit(AE_model, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader)
 
     # load trained model from checkpoint and test
-    model_adni = AE_model.load_saved_model(checkpoint_path="T1_128/trainAE_adni/last.ckpt")
-    print("Evaluating on test data...")
-    test_rslt = trainer.test(
-        model=model_adni,
-        dataloaders=test_dataloader,
-        verbose=True
-    )
+    #ckpt_pth = '/m/Researchers/Eliana/DeepENDO/training/T1_128/DLMUSE_ADNI_normative/last.ckpt'
+    #AE_model = AE_model.load_saved_model(checkpoint_path=ckpt_pth)
+    
+    #print("Evaluating on test data...")
+    test_rslt = trainer.test(model=AE_model, dataloaders=test_dataloader, verbose=True)
     print(f"Test loss: {test_rslt[0]['test_loss']:.6f}")
-
-    # plot reconstructions from test data
-    title = 'orig_recon_trainAE_adni.png'
-    model_adni.plot_recon(model=model_adni, test_loader=test_dataloader, plot_title=title)
+    
+    # compute losses and plot reconstructions
+    plot_train = 'adni_dlmuse_normative_traindata_udip_recon.png'
+    csv_train = 'adni_dlmuse_normative_traindata_udip_losses.csv'
+    plot_val = 'adni_dlmuse_normative_valdata_udip_recon.png'
+    csv_val = 'adni_dlmuse_normative_valdata_udip_losses.csv'
+    plot_test = 'adni_dlmuse_normative_testdata_udip_recon.png'
+    csv_test = 'adni_dlmuse_normative_testdata_udip_losses.csv'
+    #plot_disc = 'adni_dlmuse_normative_discdata_udip_recon.png'
+    #csv_disc = 'adni_dlmuse_normative_discdata_udip_losses.csv'
+    AE_model.plot_recon(model=AE_model, loader=train_dataloader, plot_title=plot_train, csv_title=csv_train)
+    AE_model.plot_recon(model=AE_model, loader=val_dataloader, plot_title=plot_val, csv_title=csv_val)
+    AE_model.plot_recon(model=AE_model, loader=test_dataloader, plot_title=plot_test, csv_title=csv_test)
+    #AE_model.plot_recon(model=AE_model, loader=disc_dataloader, plot_title=plot_disc, csv_title=csv_disc)
 

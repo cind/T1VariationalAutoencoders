@@ -1,5 +1,6 @@
 wheel
 numpy<2.0.0
+scipy
 pandas
 nibabel
 matplotlib
@@ -10,3 +11,4 @@ torchmetrics
 torchvision
 pytorch-lightning
 monai==0.7.0
+umap-learn

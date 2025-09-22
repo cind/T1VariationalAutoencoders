@@ -14,11 +14,32 @@ from tensorflow.keras.models import load_model, save_model
 from tensorflow.keras.optimizers import Adam, schedules
 from tensorflow.keras.callbacks import EarlyStopping
 from antspynet.architectures import create_convolutional_autoencoder_model_3d
+# metrics 
+from skimage.metrics import peak_signal_noise_ratio as psnr
+from skimage.metrics import structural_similarity as ssim
 
 # LOCAL IMPORTS
 from utils import exceptions
 
 logger = logging.getLogger(__name__)
+
+
+# compute MSE, MAE, PSNR, SSIM from reconstructed sample
+def compute_metrics(original, recon, mask=None):
+    if isinstance(original, torch.Tensor):
+        original = original.squeeze().cpu().numpy()
+    if isinstance(recon, torch.Tensor):    
+        recon = recon.squeeze().cpu().numpy()
+    if mask is not None:
+        if isinstance(mask, torch.Tensor):
+            mask = mask.squeeze().cpu().numpy()
+        original *= mask
+        recon *= mask
+    mse = np.mean((original - recon) ** 2)
+    mae = np.mean(np.abs(original - recon))
+    psnr_val = psnr(original, recon, data_range=original.max() - original.min())
+    ssim_val = ssim(original, recon, data_range=original.max() - original.min())
+    return mse, mae, psnr_val, ssim_val
 
 
 class DataGenerator(Sequence):
@@ -73,13 +94,17 @@ class DataGenerator(Sequence):
             y[i,:,:,:,0] = data
         return x, y
 
-    def get_random_sample(self, n_samples):
+    def get_random_sample(self, n_samples, sample_filepath=None):
         """Use for test generator only"""
         test_data = self.filenames
-        indices = np.random.choice(len(test_data), n_samples, replace=False)
+        if sample_filepath:
+            indices = [line.replace('\n','') for line in open(sample_filepath,'r')]
+        else:
+            indices = np.random.choice(len(test_data), n_samples, replace=False)
         x = np.empty((n_samples, *self.data_shape))
         for i, idx in enumerate(indices):
-            item = test_data[idx]
+            #item = test_data[idx]
+            item = indices[i]
             item = os.path.join(os.getcwd(), 'data', 'regtoMNI', 'testing', item)
             img = nib.load(item)
             data = img.get_fdata() 
@@ -161,11 +186,31 @@ class T1CAEModel():
         mid_idx = depth//2
         return image[:,:,mid_idx]
     
-    def plot_orig_and_recon(self, autoencoder, n_samples, filepath):
+    def plot_orig_and_recon(self, autoencoder, n_samples, filepath, sample_filepath=None):
         # get sample of reconstructed images
         test_data = DataGenerator(batch_size=self.batch_size, mode='testing')
-        orig_images = test_data.get_random_sample(n_samples) 
+        orig_images = test_data.get_random_sample(n_samples, sample_filepath) 
         recon_images = autoencoder.predict(orig_images)
+        # compute losses
+        mse_vals = []
+        mae_vals = []
+        psnr_vals = []
+        ssim_vals = []
+        for idx, orig in enumerate(orig_images):
+            orig = tf.squeeze(orig)
+            orig_max = tf.math.reduce_max(orig)
+            orig_min = tf.math.reduce_min(orig)
+            orig_np = orig.numpy().astype(np.float32)
+            recon = tf.squeeze(recon_images[idx])
+            recon_np = recon.numpy().astype(np.float32)
+            mse_vals.append(np.mean((orig_np-recon_np)**2))
+            mae_vals.append(np.mean(np.abs(orig_np-recon_np)))
+            psnr_vals.append(psnr(orig_np, recon_np, data_range=orig_max-orig_min))
+            ssim_vals.append(ssim(orig_np, recon_np, data_range=orig_max-orig_min))
+        print('MSE:', mse_vals)
+        print('MAE:', mae_vals)
+        print('PSNR:', psnr_vals)
+        print('SSIM:', ssim_vals)
         # plot original and reconstructed side by side
         fig, axes = plt.subplots(n_samples, 2, figsize=(10, n_samples*3))
         for i in range(n_samples):
@@ -192,5 +237,6 @@ if __name__ == '__main__':
     model = t1cae_model.load_model_from_file(model_filepath)
     #t1cae_model.test_model(model)
     #t1cae_model.save_model_to_file(model, filepath=model_filepath)
-    t1cae_model.plot_orig_and_recon(model, n_samples=10, filepath=vis_filepath)
+    sample_datafile = "iopaths/sample_test_vis.txt"
+    t1cae_model.plot_orig_and_recon(model, n_samples=10, filepath=vis_filepath, sample_filepath=sample_datafile)
 
