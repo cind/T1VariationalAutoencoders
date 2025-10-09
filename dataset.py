@@ -9,7 +9,7 @@ from monai import transforms
 #defining transforms
 transforms_monai = transforms.Compose([
                     transforms.AddChannel(),
-                    #transforms.ResizeWithPadOrCrop(spatial_size=(184,224,184)), 
+                    transforms.ResizeWithPadOrCrop(spatial_size=(184,224,184)), 
                     #transforms.ScaleIntensity(minv=0.0, maxv=1.0),
                     transforms.ToTensor()])
 
@@ -25,8 +25,6 @@ class aedataset(torch.utils.data.Dataset):
             mask [torch tensor]: mask excluding background
         """
         self.image_list = [line.replace('\n','') for line in open(datafile, 'r')]
-        #for i in self.image_list:
-        #    i = i.replace('regtoMNI', 'zscore_norm')
         self.transforms = transforms
         self.return_affine = return_affine
         self.return_img_name = return_img_name

@@ -1,18 +1,17 @@
-# imports
 import os, math, gc, random
 import numpy as np
 import pandas as pd
 import nibabel as nib
 import matplotlib.pyplot as plt
-from skimage.metrics import peak_signal_noise_ratio as psnr
-from skimage.metrics import structural_similarity as ssim
+from skimage.metrics import peak_signal_noise_ratio as get_psnr
+from skimage.metrics import structural_similarity as get_ssim
 
 # DL imports
 import torch
 from torch import nn
 import torch.utils.checkpoint as cp
 from torch.nn import functional as F
-from torch.nn import MSELoss
+from torch.nn import MSELoss, L1Loss
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import (
@@ -21,6 +20,9 @@ from pytorch_lightning.callbacks import (
     ProgressBar,
     TQDMProgressBar)
 from pytorch_lightning.loggers import TensorBoardLogger, CSVLogger
+
+from torchmetrics.functional import structural_similarity_index_measure
+from torchmetrics.functional import peak_signal_noise_ratio
 import monai
 from monai.networks.nets import VarAutoEncoder
 from monai import transforms
@@ -29,14 +31,16 @@ from monai import transforms
 from dataset import *
 
 # loss functions
-def vae_loss(recon, x, mu, logvar, beta, scale_mse=1):
-    recon = torch.clamp(recon, min=-10, max=-10)
-    recon_loss = F.mse_loss(recon, x, reduction="mean")
+def vae_loss(recon, x, mask, mu, logvar, alpha, beta):
+    #recon = torch.clamp(recon, min=-10, max=10)
+    #recon_loss = F.mse_loss(recon, x, reduction="mean")
+    recon_loss = F.l1_loss(recon, x, reduction='none')
+    recon_loss_masked = (recon_loss.squeeze(1) * mask).sum() / mask.sum()
     logvar = torch.clamp(logvar, min=-10, max=10)
     kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
     kl_loss = kl_loss.mean()
-    loss = scale_mse*recon_loss + beta*kl_loss
-    return loss, recon_loss, kl_loss
+    loss = alpha*recon_loss_masked + beta*kl_loss
+    return loss, recon_loss_masked, kl_loss
 
 def cae_loss(recon, x, mask=None):
     if mask is not None:
@@ -68,17 +72,16 @@ def compute_metrics(original, recon, mask=None):
         recon *= mask
     mse = np.mean((original - recon) ** 2)
     mae = np.mean(np.abs(original - recon))
-    psnr_val = psnr(original, recon, data_range=original.max() - original.min())
-    ssim_val = ssim(original, recon, data_range=original.max() - original.min())
+    psnr_val = get_psnr(original, recon, data_range=original.max() - original.min())
+    ssim_val = get_ssim(original, recon, data_range=original.max() - original.min())
     return mse, mae, psnr_val, ssim_val
 
 # save metrics to csv
-def save_metrics(metrics_list, model_names, samples, out_csv):
+def save_metrics(metrics_list, samples, out_csv):
     rows = []
     for sample_name, sample_metric in zip(samples, metrics_list):
-        for model_name, (mse, mae, psnr_val, ssim_val) in zip(model_names, sample_metric):
+        for metric in sample_metric:
             rows.append({"Sample": sample_name,
-                         "Model": model_name,
                          "MSE": mse,
                          "MAE": mae,
                          "PSNR": psnr_val,
@@ -88,16 +91,17 @@ def save_metrics(metrics_list, model_names, samples, out_csv):
 
 # model architecture
 class VAE(pl.LightningModule):
-    def __init__(self, lr, beta):
+    def __init__(self, lr, alpha, beta):
         super().__init__()
         self.save_hyperparameters()
         self.lr = lr
+        self.alpha = alpha
         self.beta = beta
-        self.beta_max = 0.1
-        self.anneal_epochs = 20
+        self.beta_max = 1
+        self.anneal_epochs = 40
         self.latent_size = 128
         self.input_shape = (1, 184, 224, 184)
-        self.dropout_rate = 0.2
+        self.dropout_rate = 0.1
         self.kernel_size = 5
         self.channels = (16, 32, 64)
         self.strides = (2, 2, 2)
@@ -160,7 +164,7 @@ class VAE(pl.LightningModule):
         print(f"[INFO] Re-initialized non-transferred layers")
     
     # KL annealing (sigmoidal schedule) for model stability
-    def kl_anneal(self, epoch, k=2, start=10, end=40):
+    def kl_anneal(self, epoch, k=2, start=10, end=50):
         if epoch < start:
             return 0.0
         elif epoch > end:
@@ -175,9 +179,8 @@ class VAE(pl.LightningModule):
         x, mask = batch
         recon, mu, logvar, z = self(x)
         #recon, z = self(x)
-        #loss = cae_loss(recon, x, mask)
         beta = self.kl_anneal(self.current_epoch)
-        loss, recon_loss, kl_loss = vae_loss(recon, x, mu, logvar, beta)
+        loss, recon_loss, kl_loss = vae_loss(recon, x, mask, mu, logvar, self.alpha, beta)
         self.log("train_total_loss", loss, prog_bar=True)
         self.log("train_recon_loss", recon_loss, prog_bar=True)
         self.log("train_kl_loss", kl_loss, prog_bar=True)
@@ -189,8 +192,7 @@ class VAE(pl.LightningModule):
         x, mask = batch
         recon, mu, logvar, z = self(x)
         #recon, z = self(x)
-        #loss = cae_loss(recon, x, mask)
-        loss, recon_loss, kl_loss = vae_loss(recon, x, mu, logvar, self.beta)
+        loss, recon_loss, kl_loss = vae_loss(recon, x, mask, mu, logvar, self.alpha, self.beta)
         self.log("val_total_loss", loss, prog_bar=True, sync_dist=True)
         self.log("val_recon_loss", recon_loss, prog_bar=True, sync_dist=True)
         self.log("val_kl_loss", kl_loss, prog_bar=True, sync_dist=True)
@@ -199,23 +201,23 @@ class VAE(pl.LightningModule):
     # pytorch lightning test step
     def test_step(self, batch, batch_idx):
         x, mask = batch
-        #recon, mu, logvar, z = self(x)
-        recon, z = self(x)
-        loss = cae_loss(recon, x, mask)
-        #loss, recon_loss, kl_loss = vae_loss(recon, x, mu, logvar, self.beta_max)
-        #self.log("test_total_loss", loss, prog_bar=True, sync_dist=True)
-        #self.log("test_recon_loss", recon_loss, prog_bar=True, sync_dist=True)
-        #self.log("test_kl_loss", kl_loss, prog_bar=True, sync_dist=True)
+        recon, mu, logvar, z = self(x)
+        #recon, z = self(x)
+        loss, recon_loss, kl_loss = vae_loss(recon, x, mask, mu, logvar, self.alpha, self.beta_max)
+        self.log("test_total_loss", loss, prog_bar=True, sync_dist=True)
+        self.log("test_recon_loss", recon_loss, prog_bar=True, sync_dist=True)
+        self.log("test_kl_loss", kl_loss, prog_bar=True, sync_dist=True)
         return loss
     
     # visualize reconstructions of random sample of test data
-    def plot_recon(self, model, test_loader, plot_filepath, device="cuda"):
+    def plot_recon(self, model, dataloader, plot_filepath, csv_filepath, device="cuda"):
         model.eval()
         model.to(device)
-        test_dataset = test_loader.dataset
-        indices = random.sample(range(len(test_dataset)), 10)
+        dataset = dataloader.dataset
+        indices = random.sample(range(len(dataset)), 10)
         orig_imgs = []
         recon_imgs = []
+        df = pd.DataFrame(columns=['ImgIdx','MSE','MAE','PSNR','SSIM'])
         # reconstruct sample data
         for idx in indices:
             x, mask = test_dataset[idx]
@@ -224,15 +226,16 @@ class VAE(pl.LightningModule):
             mask = mask.unsqueeze(0).to(device)
             with torch.no_grad():
                 x = x * mask
-                #recon, mu, logvar, z = model(x)
-                recon, z = model(x)
+                recon, mu, logvar, z = model(x)
+                #recon, z = model(x)
                 recon = recon * mask
                 mse, mae, psnr_val, ssim_val = compute_metrics(x, recon, mask)
-                print(f"Sample {idx}: MSE={mse}, MAE={mae}, PSNR={psnr_val}, SSIM={ssim_val}")
+                df.loc[len(df)] = [idx, mse, mae, psnr_val, ssim_val]
             orig_imgs.append(x.cpu())
             recon_imgs.append(recon.cpu())
         orig_imgs = torch.cat(orig_imgs, dim=0)
         recon_imgs = torch.cat(recon_imgs, dim=0)
+        df.to_csv(csv_filepath, index=False)
         # plot orig and recon
         fig, axes = plt.subplots(nrows=10, ncols=6, figsize=(15,25))
         slice_fracs = [0.25, 0.5, 0.75]
@@ -276,15 +279,16 @@ class VAE(pl.LightningModule):
         }
 
 # defining datasets
-train_dataset = aedataset(datafile="/m/Researchers/Eliana/DeepENDO/training/iopaths/train_data.txt", transforms=transforms_monai)
+iodir = '/m/Researchers/Eliana/DeepENDO/training/iopaths'
+train_dataset = aedataset(datafile=os.path.join(iodir, "adni_dlmuse_normative/train_paths.txt"), transforms=transforms_monai)
 train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=12, pin_memory=True, num_workers=4, shuffle=True)
-val_dataset = aedataset(datafile="/m/Researchers/Eliana/DeepENDO/training/iopaths/val_data.txt", transforms=transforms_monai)
+val_dataset = aedataset(datafile=os.path.join(iodir, "adni_dlmuse_normative/val_paths.txt"), transforms=transforms_monai)
 val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=12, pin_memory=True, num_workers=4, shuffle=False)
-test_dataset = aedataset(datafile="/m/Researchers/Eliana/DeepENDO/training/iopaths/test_data.txt", transforms=transforms_monai)
+test_dataset = aedataset(datafile=os.path.join(iodir, "adni_dlmuse_normative/test_paths.txt"), transforms=transforms_monai)
 test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=12, pin_memory=True, num_workers=4, shuffle=True)
 
-dir_name = "model_checkpoints/vae/transfer"
-model = VAE(lr=0.001, beta=0.1)
+dir_name = "model_checkpoints/vae"
+model = VAE(lr=0.001, alpha=10, beta=0.1)
 lr_monitor = LearningRateMonitor(logging_interval="epoch")
 
 # saving checkpoints monitoring validation loss
@@ -292,8 +296,8 @@ model_checkpoint = ModelCheckpoint(
     dirpath=dir_name,
     monitor="val_total_loss",
     save_last=True,
-    filename="{epoch}-{train_total_loss:.6f}-{val_total_loss:.6f}",
-    save_top_k=5)
+    filename="{epoch}-{train_total_loss:.4f}-{val_total_loss:.4f}",
+    save_top_k=8)
 
 # loggers
 pb = TQDMProgressBar()
@@ -303,7 +307,7 @@ if __name__ == "__main__":
     gc.collect()
     torch.cuda.empty_cache()
     
-    epochs=50
+    epochs=100
     trainer = pl.Trainer(
         precision="16-mixed",
         accelerator="gpu",
@@ -319,27 +323,28 @@ if __name__ == "__main__":
     )
 
     # transfer encoder and decoder weights from trained CAE --> current VAE
-    cae_ckpt = "model_checkpoints/cae/vae-noresample-noKL.ckpt"
-    #model.transfer_weights(cae_ckpt)
+    vae_ckpt = "model_checkpoints/vae/last.ckpt"
+    #model.transfer_weights(vae_ckpt)
     
     # train model 
-    #trainer.fit(model, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader)
+    trainer.fit(model, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader)
 
-    # load trained model from checkpoint and test 
-    model0 = model.load_saved_model(checkpoint_path=cae_ckpt)
-    #model0=model
+    # test model
+    model0 = model
+    #model0 = model.load_saved_model(checkpoint_path=vae_ckpt)
     
     print("Evaluating on test data")
-    '''
-    test_rslt = trainer.test(
-        model=model0,
-        dataloaders=test_dataloader,
-        verbose=True
-    )'''
-    #print(f"Test loss: {test_rslt[0]['test_total_loss']:.6f}")
+    test_rslt = trainer.test(model=model0, dataloaders=test_dataloader, verbose=True)
+    print(f"Test loss: {test_rslt[0]['test_total_loss']:.6f}")
 
-    # plot reconstructions from test data
-    #p = 'model_performance/VAE_xfer_orig_recon_adni.png'
-    p = 'model_performance/CAE_orig_recon_adni.png'
-    model0.plot_recon(model=model0, test_loader=test_dataloader, plot_filepath=p)
+    # save losses and plot reconstructions from each dataset
+    plot_train = 'adni_dlmuse_normative_traindata_udip_recon.png'
+    csv_train = 'adni_dlmuse_normative_traindata_udip_losses.csv'
+    plot_val = 'adni_dlmuse_normative_valdata_udip_recon.png'
+    csv_val = 'adni_dlmuse_normative_valdata_udip_losses.csv'
+    plot_test = 'adni_dlmuse_normative_testdata_udip_recon.png'
+    csv_test = 'adni_dlmuse_normative_testdata_udip_losses.csv'
+    model0.plot_recon(model=model0, dataloader=train_dataloader, plot_filepath=plot_train, csv_filepath=csv_train)
+    model0.plot_recon(model=model0, dataloader=val_dataloader, plot_filepath=plot_val, csv_filepath=csv_val)
+    model0.plot_recon(model=model0, dataloader=test_dataloader, plot_filepath=plot_test, csv_filepath=csv_test)
 

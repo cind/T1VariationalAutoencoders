@@ -2,8 +2,8 @@
 import os, gc, random
 import numpy as np
 import matplotlib.pyplot as plt
-from skimage.metrics import peak_signal_noise_ratio as psnr
-from skimage.metrics import structural_similarity as ssim
+from skimage.metrics import peak_signal_noise_ratio as get_psnr
+from skimage.metrics import structural_similarity as get_ssim
 from monai import transforms
 
 # PyTorch
@@ -23,6 +23,10 @@ from pytorch_lightning.callbacks import (
 )
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger, CSVLogger
+from torchmetrics.image import StructuralSimilarityIndexMeasure as SSIM
+from torchmetrics.image import PeakSignalNoiseRatio as PSNR
+from torchmetrics.functional import structural_similarity_index_measure
+from torchmetrics.functional import peak_signal_noise_ratio
 
 # Custom imports
 from dataset import *
@@ -40,14 +44,61 @@ def compute_metrics(original, recon, mask=None):
         recon *= mask
     mse = np.mean((original - recon) ** 2)
     mae = np.mean(np.abs(original - recon))
-    psnr_val = psnr(original, recon, data_range=original.max() - original.min())
-    ssim_val = ssim(original, recon, data_range=original.max() - original.min())
+    psnr_val = get_psnr(original, recon, data_range=original.max() - original.min())
+    ssim_val = get_ssim(original, recon, data_range=original.max() - original.min())
     return mse, mae, psnr_val, ssim_val
 
-# Model architecture and forward pass to Pytorch lightning module.
 
+# combined reconstruction (MSE/MAE) & SSIM loss
+class ReconSSIMLoss(torch.nn.Module):
+    def __init__(self, alpha, beta, loss_type='MSE', kernel_size=5):
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.kernel_size = kernel_size
+        if loss_type == 'MSE':
+            self.loss = torch.nn.MSELoss(reduction='none')
+        elif loss_type == 'MAE':    
+            self.loss = torch.nn.L1Loss(reduction='none')
+        #self.data_range = data_range
+
+    def forward(self, target: torch.Tensor, preds: torch.Tensor, mask: torch.Tensor):
+        with torch.no_grad():
+            mean_ssim = structural_similarity_index_measure(
+                preds=preds,
+                target=target,
+                reduction='elementwise_mean',
+                #data_range=self.data_range,
+                kernel_size=self.kernel_size)
+        loss = self.loss(target, preds)
+        loss_masked = (loss.squeeze(1) * mask).sum() / mask.sum()
+        total_loss = self.alpha * loss_masked + self.beta * (1 - mean_ssim)
+        return total_loss
+
+
+# combined MAE & PSNR loss
+class MAE_PSNR_loss(torch.nn.Module):
+    def __init__(self, alpha, beta):
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.mse_loss = torch.nn.MSELoss(reduction='none')
+        self.mae_loss = torch.nn.L1Loss(reduction='none')
+
+    def forward(self, target: torch.Tensor, preds: torch.Tensor, mask: torch.Tensor):
+        mae = self.mae_loss(target, preds)
+        mae_masked = (mae.squeeze(1) * mask).sum() / mask.sum()
+        mse = self.mse_loss(target, preds)
+        mse_masked = (mse.squeeze(1) * mask).sum() / mask.sum()
+        psnr = 10 * torch.log10((target.max())**2 / (mse_masked + 1e-8))
+        psnr_loss = 1.0 / (psnr + 1e-8)
+        loss = self.alpha * mae_masked + self.beta * psnr_loss
+        return loss
+
+
+# Model architecture and forward pass to Pytorch lightning module.
 class engine_AE(pl.LightningModule):
-    def __init__(self, lr, latent_size=128, dropout_rate=0.2):
+    def __init__(self, lr, latent_size=128, dropout_rate=0.1):
         super().__init__()
         self.save_hyperparameters()
         self.latent_size = latent_size
@@ -86,14 +137,14 @@ class engine_AE(pl.LightningModule):
         # last CNN block
         self.last_cnn = self.last_CNN_block(16, 1)
 
-        # loss function to be used in training loop
-        self.train_loss_function1 = torch.nn.MSELoss(
-            size_average=None, reduce=None, reduction="none"
-        )
-        # loss function to be used in validation loop
-        self.valid_loss_function = torch.nn.MSELoss(
-            size_average=None, reduce=None, reduction="none"
-        )
+        # MSE loss function
+        self.mse_loss = torch.nn.MSELoss(reduction="none")
+
+        # MAE loss function
+        self.mae_loss = torch.nn.L1Loss(reduction='none')
+
+        # loss functions combining metrics
+        self.loss_func = ReconSSIMLoss(alpha=1, beta=1, loss_type='MSE')
 
     def max_poold(self, max_padding):
         max_pd = nn.MaxPool3d(kernel_size=2, padding=max_padding)
@@ -104,10 +155,10 @@ class engine_AE(pl.LightningModule):
             nn.Conv3d(input_channels, output_channels, kernel_size=3, padding=padding,),
             nn.BatchNorm3d(output_channels),
             nn.LeakyReLU(inplace=True),
+            #nn.Dropout3d(self.dropout_rate),
             nn.Conv3d(output_channels, output_channels, kernel_size=3, padding=padding),
             nn.BatchNorm3d(output_channels),
             nn.LeakyReLU(inplace=True),
-            nn.Dropout3d(self.dropout_rate),
         )
 
         return encoder
@@ -128,10 +179,10 @@ class engine_AE(pl.LightningModule):
             nn.Conv3d(input_channels, output_channels, kernel_size=3, padding=1,),
             nn.BatchNorm3d(output_channels),
             nn.LeakyReLU(inplace=True),
+            #nn.Dropout3d(self.dropout_rate),
             nn.Conv3d(output_channels, output_channels, kernel_size=3, padding=1),
             nn.BatchNorm3d(output_channels),
             nn.LeakyReLU(inplace=True),
-            nn.Dropout3d(self.dropout_rate),
         )
         return decoder
 
@@ -143,7 +194,6 @@ class engine_AE(pl.LightningModule):
             nn.Conv3d(output_channels, output_channels, kernel_size=3, padding=padding),
             nn.BatchNorm3d(output_channels),
             nn.LeakyReLU(inplace=True),
-            nn.Dropout3d(self.dropout_rate),
         )
 
         return cnn_block
@@ -156,7 +206,6 @@ class engine_AE(pl.LightningModule):
             nn.Conv3d(input_channels, input_channels, kernel_size=3, padding=padding),
             nn.BatchNorm3d(input_channels),
             nn.LeakyReLU(inplace=True),
-            nn.Dropout3d(self.dropout_rate),
             nn.Conv3d(input_channels, output_channels, kernel_size=1),
         )
 
@@ -167,10 +216,11 @@ class engine_AE(pl.LightningModule):
             self.trainer.strategy._set_static_graph()
     
     # load from checkpoint
-    def load_saved_model(self, checkpoint_path):
+    def load_saved_model(self, checkpoint_path, eval_mode=True):
         model = engine_AE.load_from_checkpoint(checkpoint_path)    
-        model.eval()
-        model.freeze()
+        if eval_mode:
+            model.eval()
+            model.freeze()
         return model
     
     # Forward function
@@ -217,15 +267,14 @@ class engine_AE(pl.LightningModule):
 
     # pytorch lightning training step
     def training_step(self, batch, batch_idx):
-        # x, reg_input = batch
         x, mask = batch
         recon, _ = self(x)
-        loss1 = self.train_loss_function1(x, recon)
-        loss1 = loss1.squeeze(1) * mask
-        loss1 = loss1.sum()
-        loss1 = loss1 / mask.sum()
-        # loss2 = self.train_loss_function(reg_input, reg)
-        # loss = loss1 + loss2
+        #loss1 = self.mse_loss(x, recon)
+        #loss1 = self.mae_loss(x, recon)
+        #loss1 = loss1.squeeze(1) * mask
+        #loss1 = loss1.sum()
+        #loss1 = loss1 / mask.sum()
+        loss1 = self.loss_func(x, recon, mask)
         self.log("train_loss", loss1, prog_bar=True)
         return loss1
 
@@ -233,26 +282,25 @@ class engine_AE(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         x, mask = batch
         recon, _ = self(x)
-        loss1 = self.valid_loss_function(x, recon)
-        loss1 = loss1.squeeze(1) * mask
-        loss1 = loss1.sum()
-        loss1 = loss1 / mask.sum()
-        # loss2 = self.train_loss_function(reg_input, reg)
-        # loss = loss1 + loss2
+        #loss1 = self.mse_loss(x, recon)
+        #loss1 = self.mae_loss(x, recon)
+        #loss1 = loss1.squeeze(1) * mask
+        #loss1 = loss1.sum()
+        #loss1 = loss1 / mask.sum()
+        loss1 = self.loss_func(x, recon, mask)
         self.log("val_loss", loss1, prog_bar=True, sync_dist=True)
         return loss1
 
     # pytorch lightning test step
     def test_step(self, batch, batch_idx):
         x, mask = batch
-        #x, mask, aff, img_name = batch
         recon, _ = self(x)
-        loss1 = self.valid_loss_function(x, recon)
-        loss1 = loss1.squeeze(1) * mask
-        loss1 = loss1.sum()
-        loss1 = loss1 / mask.sum()
-        # loss2 = self.train_loss_function(reg_input, reg)
-        # loss = loss1 + loss2
+        #loss1 = self.mse_loss(x, recon)
+        #loss1 = self.mae_loss(x, recon)
+        #loss1 = loss1.squeeze(1) * mask
+        #loss1 = loss1.sum()
+        #loss1 = loss1 / mask.sum()
+        loss1 = self.loss_func(x, recon, mask)
         self.log("test_loss", loss1, prog_bar=True, sync_dist=True)
         return loss1
     
@@ -294,7 +342,6 @@ class engine_AE(pl.LightningModule):
                 recon = recon * mask
                 mse, mae, psnr_val, ssim_val = compute_metrics(x, recon, mask)
                 df.loc[len(df)] = [img_name, mse, mae, psnr_val, ssim_val]
-                #print(f"{img_name}: MSE={mse}, MAE={mae}, PSNR={psnr_val}, SSIM={ssim_val}")
             orig_imgs.append(x.cpu())
             recon_imgs.append(recon.cpu())
             # save orig and recon niftis
@@ -326,13 +373,13 @@ class engine_AE(pl.LightningModule):
         plt.savefig(plot_title)
     
     # pytorch lightning optimizer configuration
-    def configure_optimizers(self, weight_decay_rate=1e-5):
+    def configure_optimizers(self, weight_decay_rate=1e-6):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams["lr"], weight_decay=weight_decay_rate)
         lr_scheduler_config = {
             "scheduler": ReduceLROnPlateau(
                 optimizer,
                 "min",
-                patience=4,
+                patience=10,
                 min_lr=self.hparams["lr"] / 1000,
                 factor=0.5,
             ),
@@ -348,21 +395,12 @@ class engine_AE(pl.LightningModule):
         }
 
         
-#defining transforms
-'''
-transforms_monai = transforms.Compose([
-                    transforms.AddChannel(),
-                    transforms.ResizeWithPadOrCrop(spatial_size=(184,224,184)), 
-                    #transforms.ScaleIntensity(minv=0.0, maxv=1.0),
-                    transforms.ToTensor()])
-'''
-
 # defining train dataset
 train_dataset = aedataset(
     datafile="/m/Researchers/Eliana/DeepENDO/training/iopaths/adni_dlmuse_normative/train_paths.txt", 
     transforms=transforms_monai,
     #return_affine=True,
-    #return_img_name=True
+    return_img_name=True
 )
 
 # defining train dataloader
@@ -375,7 +413,7 @@ val_dataset = aedataset(
     datafile="/m/Researchers/Eliana/DeepENDO/training/iopaths/adni_dlmuse_normative/val_paths.txt",
     transforms=transforms_monai,
     #return_affine=True,
-    #return_img_name=True
+    return_img_name=True
 )
 
 # defining validation dataloader
@@ -388,7 +426,7 @@ test_dataset = aedataset(
         datafile="/m/Researchers/Eliana/DeepENDO/training/iopaths/adni_dlmuse_normative/test_paths.txt",
         transforms=transforms_monai,
         #return_affine=True,
-        #return_img_name=True
+        return_img_name=True
 )
 
 # defining test dataloader
@@ -414,21 +452,23 @@ dir_name = '/m/Researchers/Eliana/DeepENDO/training/T1_128/DLMUSE_ADNI_normative
 
 # initiaing the model
 latent_size = 128
-AE_model = engine_AE(0.0005248074602497723, latent_size)
+orig_lr = 0.0005248074602497723
+lr = 0.001
+AE_model = engine_AE(lr, latent_size)
 
 # learning rate monitor as using scheduler
 lr_monitor = LearningRateMonitor(logging_interval="epoch")
 
 # early stopping
-early_stop = EarlyStopping(monitor='val_loss', mode='min', patience=5)
+early_stop = EarlyStopping(monitor='val_loss', mode='min', patience=40)
 
 # saving checkpoints monitoring validation loss
 model_checkpoint = ModelCheckpoint(
     dirpath=dir_name,
     monitor="val_loss",
     save_last=True,
-    filename="{epoch}-{train_loss:.6f}-{val_loss:.6f}",
-    save_top_k=5,
+    filename="{epoch}-{train_loss:.4f}-{val_loss:.4f}",
+    save_top_k=8,
 )
 
 # Loggers
@@ -457,16 +497,22 @@ if __name__ == "__main__":
         max_epochs=100,
     )
 
-    # train model 
-    trainer.fit(AE_model, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader)
-
-    # load trained model from checkpoint and test
-    #ckpt_pth = '/m/Researchers/Eliana/DeepENDO/training/T1_128/DLMUSE_ADNI_normative/last.ckpt'
-    #AE_model = AE_model.load_saved_model(checkpoint_path=ckpt_pth)
+    #orig_ckpt = '/m/Researchers/Eliana/DeepENDO/UDIP/ckpts/T1.ckpt'
+    trained_ckpt = '/m/Researchers/Eliana/DeepENDO/training/T1_128/DLMUSE_ADNI_normative/last.ckpt'
     
+    # load original UDIP checkpoint in training mode
+    #AE_model = AE_model.load_saved_model(checkpoint_path=orig_ckpt, eval_mode=False)
+    
+    # train model 
+    #trainer.fit(AE_model, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader)
+
+    # load trained model from checkpoint
+    AE_model = AE_model.load_saved_model(checkpoint_path=trained_ckpt, eval_mode=True)
+    
+    # test model
     #print("Evaluating on test data...")
-    test_rslt = trainer.test(model=AE_model, dataloaders=test_dataloader, verbose=True)
-    print(f"Test loss: {test_rslt[0]['test_loss']:.6f}")
+    #test_rslt = trainer.test(model=AE_model, dataloaders=test_dataloader, verbose=True)
+    #print(f"Test loss: {test_rslt[0]['test_loss']:.6f}")
     
     # compute losses and plot reconstructions
     plot_train = 'adni_dlmuse_normative_traindata_udip_recon.png'
