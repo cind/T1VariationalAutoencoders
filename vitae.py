@@ -1,4 +1,4 @@
-import os, math, gc, random
+import os, math, gc, random, ast
 import numpy as np
 import pandas as pd
 import nibabel as nib
@@ -23,9 +23,10 @@ from pytorch_lightning.loggers import TensorBoardLogger, CSVLogger
 
 from torchmetrics.functional import structural_similarity_index_measure
 from torchmetrics.functional import peak_signal_noise_ratio
+
 import monai
-from monai.networks.nets import VarAutoEncoder
-from monai import transforms
+#from monai.networks.nets import ViT
+from monai.networks.nets.vitautoenc import ViTAutoEnc
 
 # local imports
 from dataset import *
@@ -42,22 +43,10 @@ def vae_loss(recon, x, mask, mu, logvar, alpha, beta):
     loss = alpha*recon_loss_masked + beta*kl_loss
     return loss, recon_loss_masked, kl_loss
 
-def cae_loss(recon, x, mask=None):
-    if mask is not None:
-        #print("recon min/max/mean/nan:", recon.min().item(), recon.max().item(), recon.mean().item(), torch.isnan(recon).sum().item())
-        #print("mask sum/nan:", mask.sum().item(), torch.isnan(mask).sum().item())
-        x = x * mask
-        recon = torch.clamp(recon, 0.0, 1.0)
-        recon = recon * mask
-        se = (recon - x) ** 2
-        vxls = mask.sum() + 1e-8
-        loss = se.sum() / vxls
-        #loss = F.mse_loss(recon, x, reduction="none")
-        #loss = loss.squeeze(1) * mask
-        #loss = loss.sum() / mask.sum()
-    else:
-        loss = F.mse_loss(recon, x, reduction="mean")
-    return loss
+def masked_mse(recon, x, mask):
+    recon_loss = F.mse_loss(recon, x, reduction='none')
+    recon_loss_masked = (recon_loss.squeeze(1)).sum() / mask.sum()
+    return recon_loss_masked
 
 # compute MSE, MAE, PSNR, SSIM from reconstructed sample
 def compute_metrics(original, recon, mask=None):
@@ -90,126 +79,89 @@ def save_metrics(metrics_list, samples, out_csv):
     df.to_csv(out_csv, index=False)
 
 # model architecture
-class VAE(pl.LightningModule):
-    def __init__(self, lr, alpha, beta):
+class VTAE(pl.LightningModule):
+    def __init__(self, lr, input_shape, latent_size, patch_size):
         super().__init__()
         self.save_hyperparameters()
         self.lr = lr
-        self.alpha = alpha
-        self.beta = beta
-        self.beta_max = 1
-        self.anneal_epochs = 40
-        self.latent_size = 128
-        self.input_shape = (1, 184, 224, 184)
-        self.dropout_rate = 0.1
-        self.kernel_size = 5
-        self.channels = (16, 32, 64)
-        self.strides = (2, 2, 2)
-        self.vae_model = VarAutoEncoder(
+        self.latent_size = latent_size
+        self.patch_size = patch_size
+        self.input_shape = input_shape
+        self.dropout_rate = 0.0
+        self.num_layers = 4
+        self.mlp_dim = 512
+        self.num_heads = 4
+        self.vit_model = ViTAutoEnc(
                 spatial_dims=3,
-                in_shape=self.input_shape,
-                out_channels=1,
-                latent_size=self.latent_size,
-                channels=self.channels,
-                strides=self.strides,
-                kernel_size=self.kernel_size,
-                up_kernel_size=self.kernel_size,
-                dropout=self.dropout_rate,
-                norm='BATCH')
+                in_channels=1,
+                img_size=self.input_shape,
+                patch_size=self.patch_size,
+                hidden_size=self.latent_size,
+                mlp_dim=self.mlp_dim,
+                num_layers=self.num_layers,
+                num_heads=self.num_heads,
+                dropout_rate=self.dropout_rate,
+                )
     
     def setup(self, stage: str):
         if hasattr(self.trainer.strategy, "_set_static_graph"):
             self.trainer.strategy._set_static_graph()
     
     def forward(self, x):
-        return self.vae_model(x)
+        return self.vit_model(x)
     
     # load model from checkpoint
     def load_saved_model(self, checkpoint_path):
-        model = VAE.load_from_checkpoint(checkpoint_path)    
+        model = VTAE.load_from_checkpoint(checkpoint_path)    
         model.eval()
         model.freeze()
         return model
     
-    # transfer encoder/decoder weights from CAE to VAE
-    def transfer_weights(self, checkpoint_path):
-        cae_ckpt = torch.load(checkpoint_path)
-        cae_state = cae_ckpt["state_dict"] if "state_dict" in cae_ckpt else cae_ckpt
-        vae_state = self.vae_model.state_dict()
-        xferred_keys = []
-        # transfer encoder and decoder weights 
-        pfx = "vae_model."
-        for cae_key, cae_weight in cae_state.items():
-            k = cae_key.replace(pfx,"")
-            if k in vae_state and cae_weight.shape == vae_state[k].shape:
-                vae_state[k] = cae_weight
-                xferred_keys.append(k)
-        self.vae_model.load_state_dict(vae_state)        
-        print(f"[INFO] Transferred {len(xferred_keys)} encoder & decoder layers to VAE")
-        # re-initialize remaining layers
-        xferred_pfxs = set(k.rsplit(".",1)[0] for k in xferred_keys)
-        for name, module in self.vae_model.named_modules():
-            if name in xferred_pfxs:
-                continue
-            if isinstance(module, (nn.Conv3d, nn.ConvTranspose3d, nn.Linear)):
-                if hasattr(module, "weight") and module.weight is not None:
-                    nn.init.kaiming_normal_(module.weight, nonlinearity="relu")
-                if hasattr(module, "bias") and module.bias is not None:
-                    nn.init.constant_(module.bias, 0.0)
-            elif isinstance(module, (nn.BatchNorm3d, nn.InstanceNorm3d)): 
-                if hasattr(module, "weight") and module.weight is not None:
-                    nn.init.constant_(module.weight, 1.0)
-                if hasattr(module, "bias") and module.bias is not None:    
-                    nn.init.constant_(module.bias, 0.0)
-        print(f"[INFO] Re-initialized non-transferred layers")
-    
-    # KL annealing (sigmoidal schedule) for model stability
-    def kl_anneal(self, epoch, k=2, start=10, end=50):
-        if epoch < start:
-            return 0.0
-        elif epoch > end:
-            return self.beta_max
-        else:
-            progr = (epoch-start)/(end-start)
-            b = self.beta_max/(1+np.exp(-k*(progr-0.5)))
-            return b.item()
-    
     # pytorch lightning training step
     def training_step(self, batch, batch_idx):
-        x, mask = batch
-        recon, mu, logvar, z = self(x)
-        #recon, z = self(x)
-        beta = self.kl_anneal(self.current_epoch)
-        loss, recon_loss, kl_loss = vae_loss(recon, x, mask, mu, logvar, self.alpha, beta)
-        self.log("train_total_loss", loss, prog_bar=True)
-        self.log("train_recon_loss", recon_loss, prog_bar=True)
-        self.log("train_kl_loss", kl_loss, prog_bar=True)
-        self.log("train_beta", beta, prog_bar=True)
+        x, mask, imgcode = batch
+        recon, z = self(x)
+        loss = masked_mse(recon, x, mask)
+        self.log("train_loss", loss, prog_bar=True)
         return loss
 
     # pytorch lightning validation step
     def validation_step(self, batch, batch_idx):
-        x, mask = batch
-        recon, mu, logvar, z = self(x)
-        #recon, z = self(x)
-        loss, recon_loss, kl_loss = vae_loss(recon, x, mask, mu, logvar, self.alpha, self.beta)
-        self.log("val_total_loss", loss, prog_bar=True, sync_dist=True)
-        self.log("val_recon_loss", recon_loss, prog_bar=True, sync_dist=True)
-        self.log("val_kl_loss", kl_loss, prog_bar=True, sync_dist=True)
+        x, mask, imgcode = batch
+        recon, z = self(x)
+        loss = masked_mse(recon, x, mask)
+        self.log("val_loss", loss, prog_bar=True, sync_dist=True)
         return loss
 
     # pytorch lightning test step
     def test_step(self, batch, batch_idx):
-        x, mask = batch
-        recon, mu, logvar, z = self(x)
-        #recon, z = self(x)
-        loss, recon_loss, kl_loss = vae_loss(recon, x, mask, mu, logvar, self.alpha, self.beta_max)
-        self.log("test_total_loss", loss, prog_bar=True, sync_dist=True)
-        self.log("test_recon_loss", recon_loss, prog_bar=True, sync_dist=True)
-        self.log("test_kl_loss", kl_loss, prog_bar=True, sync_dist=True)
+        x, mask, imgcode = batch
+        recon, z = self(x)
+        loss = masked_mse(recon, x, mask)
+        self.log("test_loss", loss, prog_bar=True, sync_dist=True)
         return loss
     
-    # visualize reconstructions of random sample of test data
+    # extract latent embeddings from trained model
+    def extract_latents(self, model, dataloader, csv_filepath, device="cuda"):
+        """
+        Latent embeddings for ViTAE are hierarchical and patchwise: shape=[num_layers, batch_size, num_patches, latent_size].
+        To get single vector, need to aggregate over patches --  try mean pooling over last layer.
+        """
+        model.eval()
+        model = model.to(device)
+        dataset = dataloader.dataset
+        embeddings = {}
+        for idx, batch in enumerate(dataset): # batch_size=1 for discovery data
+            x, mask, imgcode = batch
+            x = x.unsqueeze(0).to(device)
+            with torch.no_grad():
+                recon, z = model(x)
+                z_vec = z[-1].as_tensor().mean(dim=1).squeeze(0).detach().cpu().tolist()
+                embeddings[idx] = [imgcode, z_vec]
+        df = pd.DataFrame.from_dict(embeddings, orient='index', columns=['ImgCode', 'Embedding'])
+        df.to_csv(csv_filepath, index=False)
+    
+    # visualize reconstructions of random sample of data
     def plot_recon(self, model, dataloader, plot_filepath, csv_filepath, device="cuda"):
         model.eval()
         model.to(device)
@@ -217,20 +169,19 @@ class VAE(pl.LightningModule):
         indices = random.sample(range(len(dataset)), 10)
         orig_imgs = []
         recon_imgs = []
-        df = pd.DataFrame(columns=['ImgIdx','MSE','MAE','PSNR','SSIM'])
+        df = pd.DataFrame(columns=['ImgCode','MSE','MAE','PSNR','SSIM'])
         # reconstruct sample data
         for idx in indices:
-            x, mask = test_dataset[idx]
+            x, mask, imgcode = dataset[idx]
             #mask = (mask > 0.5).float()
             x = x.unsqueeze(0).to(device)
-            mask = mask.unsqueeze(0).to(device)
+            #mask = mask.unsqueeze(0).to(device)
             with torch.no_grad():
-                x = x * mask
-                recon, mu, logvar, z = model(x)
-                #recon, z = model(x)
-                recon = recon * mask
+                #x = x * mask
+                recon, z = model(x)
+                #recon = recon * mask
                 mse, mae, psnr_val, ssim_val = compute_metrics(x, recon, mask)
-                df.loc[len(df)] = [idx, mse, mae, psnr_val, ssim_val]
+                df.loc[len(df)] = [imgcode, mse, mae, psnr_val, ssim_val]
             orig_imgs.append(x.cpu())
             recon_imgs.append(recon.cpu())
         orig_imgs = torch.cat(orig_imgs, dim=0)
@@ -269,7 +220,7 @@ class VAE(pl.LightningModule):
             ),
             "interval": "epoch",
             "frequency": 1,
-            "monitor": "val_total_loss",
+            "monitor": "val_loss",
             "strict": True,
             "name": None,
         }
@@ -278,25 +229,37 @@ class VAE(pl.LightningModule):
             "lr_scheduler": lr_scheduler_config,
         }
 
-# defining datasets
-iodir = '/m/Researchers/Eliana/DeepENDO/training/iopaths'
-train_dataset = aedataset(datafile=os.path.join(iodir, "adni_dlmuse_normative/train_paths.txt"), transforms=transforms_monai)
-train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=12, pin_memory=True, num_workers=4, shuffle=True)
-val_dataset = aedataset(datafile=os.path.join(iodir, "adni_dlmuse_normative/val_paths.txt"), transforms=transforms_monai)
-val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=12, pin_memory=True, num_workers=4, shuffle=False)
-test_dataset = aedataset(datafile=os.path.join(iodir, "adni_dlmuse_normative/test_paths.txt"), transforms=transforms_monai)
-test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=12, pin_memory=True, num_workers=4, shuffle=True)
-
-dir_name = "model_checkpoints/vae"
-model = VAE(lr=0.001, alpha=10, beta=0.1)
+# defining model
+#dir_name = "model_checkpoints/ViTAE/normative"
+dir_name = "model_checkpoints/ViTAE/devcohort1/latent32_patch16"
+lr = 0.001
+input_shape = (176, 224, 176) # each dim must be divisible by patch size
+latent_size = 32
+patch_size = 16
+model = VTAE(lr, input_shape, latent_size, patch_size)
 lr_monitor = LearningRateMonitor(logging_interval="epoch")
+
+# defining datasets
+#iodir = '/m/Researchers/Eliana/T1VariationalAutoencoders/iopaths/dlmuse_normative_modeling'
+iodir = '/m/Researchers/Eliana/T1VariationalAutoencoders/iopaths/dlmuse_dev1_all'
+#train_dataset = aedataset(datafile=os.path.join(iodir, "train_paths.txt"))
+train_dataset = aedataset(datafile=os.path.join(iodir, "train_paths.txt"), image_size=input_shape, return_img_name=True)
+train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=12, pin_memory=True, num_workers=4, shuffle=True)
+#val_dataset = aedataset(datafile=os.path.join(iodir, "val_paths.txt"))
+val_dataset = aedataset(datafile=os.path.join(iodir, "val_paths.txt"), image_size=input_shape, return_img_name=True)
+val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=12, pin_memory=True, num_workers=4, shuffle=False)
+#test_dataset = aedataset(datafile=os.path.join(iodir, "test_paths.txt"))
+test_dataset = aedataset(datafile=os.path.join(iodir, "test_paths.txt"), image_size=input_shape, return_img_name=True)
+test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=12, pin_memory=True, num_workers=4, shuffle=False)
+disc_dataset = aedataset(datafile=os.path.join(iodir, "discovery_paths.txt"), image_size=input_shape, return_img_name=True)
+disc_dataloader = torch.utils.data.DataLoader(disc_dataset, batch_size=1, pin_memory=True, num_workers=4, shuffle=False)
 
 # saving checkpoints monitoring validation loss
 model_checkpoint = ModelCheckpoint(
     dirpath=dir_name,
-    monitor="val_total_loss",
+    monitor="val_loss",
     save_last=True,
-    filename="{epoch}-{train_total_loss:.4f}-{val_total_loss:.4f}",
+    filename="{epoch}-{train_loss:.4f}-{val_loss:.4f}",
     save_top_k=8)
 
 # loggers
@@ -322,29 +285,33 @@ if __name__ == "__main__":
         max_epochs=epochs,
     )
 
-    # transfer encoder and decoder weights from trained CAE --> current VAE
-    vae_ckpt = "model_checkpoints/vae/last.ckpt"
-    #model.transfer_weights(vae_ckpt)
+    vitae_ckpt = "model_checkpoints/ViTAE/devcohort1/latent32_patch16/last.ckpt"
     
     # train model 
     trainer.fit(model, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader)
 
-    # test model
+    # load model from checkpoint
     model0 = model
-    #model0 = model.load_saved_model(checkpoint_path=vae_ckpt)
+    #model0 = model.load_saved_model(checkpoint_path=vitae_ckpt)
     
+    # test model
     print("Evaluating on test data")
     test_rslt = trainer.test(model=model0, dataloaders=test_dataloader, verbose=True)
-    print(f"Test loss: {test_rslt[0]['test_total_loss']:.6f}")
+    print(f"Test loss: {test_rslt[0]['test_loss']:.6f}")
 
     # save losses and plot reconstructions from each dataset
-    plot_train = 'adni_dlmuse_normative_traindata_udip_recon.png'
-    csv_train = 'adni_dlmuse_normative_traindata_udip_losses.csv'
-    plot_val = 'adni_dlmuse_normative_valdata_udip_recon.png'
-    csv_val = 'adni_dlmuse_normative_valdata_udip_losses.csv'
-    plot_test = 'adni_dlmuse_normative_testdata_udip_recon.png'
-    csv_test = 'adni_dlmuse_normative_testdata_udip_losses.csv'
+    plot_train = 'adni_dlmuse_traindata_recon.png'
+    csv_train = 'adni_dlmuse_traindata_losses.csv'
+    plot_val = 'adni_dlmuse_valdata_recon.png'
+    csv_val = 'adni_dlmuse_valdata_losses.csv'
+    plot_test = 'adni_dlmuse_testdata_recon.png'
+    csv_test = 'adni_dlmuse_testdata_losses.csv'
+    plot_disc = 'adni_dlmuse_discdata_recon.png'
+    csv_disc = 'adni_dlmuse_discdata_losses.csv'
+    #csv_disc_latents = 'adni_dlmuse_discdata_latents.csv'
     model0.plot_recon(model=model0, dataloader=train_dataloader, plot_filepath=plot_train, csv_filepath=csv_train)
     model0.plot_recon(model=model0, dataloader=val_dataloader, plot_filepath=plot_val, csv_filepath=csv_val)
     model0.plot_recon(model=model0, dataloader=test_dataloader, plot_filepath=plot_test, csv_filepath=csv_test)
+    model0.plot_recon(model=model0, dataloader=disc_dataloader, plot_filepath=plot_disc, csv_filepath=csv_disc)
+    #model0.extract_latents(model=model0, dataloader=disc_dataloader, csv_filepath=csv_disc_latents)
 

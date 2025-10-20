@@ -20,7 +20,7 @@ class DatasetADNI:
     """
     Dataset builder for general predictive models on ADNI data.
     Use discovery data cohort only.
-    Input (x_data): encodings from UDIP model trained on ADNI dev cohort.
+    Input (x_data): embeddings trained on ADNI dev cohort.
     Target (y_data): measured covariates.
     """
 
@@ -30,10 +30,10 @@ class DatasetADNI:
         self.fmap_size = fmap_size
         #self.datafile = os.path.join(self.label_dir, 'udip_data_covars.csv')
         #self.datafile = os.path.join(self.label_dir, 'adni_udip_covars_wmh.csv')
-        self.datafile = os.path.join(self.label_dir, 'adni3_dlmuse_covars.csv')
+        self.datafile = os.path.join(self.label_dir, 'discdata_covars_latents.csv')
         self.data = pd.read_csv(self.datafile)
         #self.covars = ['Sex', 'APOE4', 'DX', 'Amyloid', 'AdniPhase', 'YrsEdu', 'Age', 'CDRSB', 'Centiloids']
-        self.covars = ['Sex', 'APOE4', 'DX', 'Amyloid', 'YrsEdu', 'Age', 'CDRSB', 'Centiloids', 'NORM_GRAY', 'NORM_WMH']
+        self.covars = ['Sex', 'APOE4', 'DX', 'Amyloid', 'Age', 'LogCDRSB', 'Centiloids', 'LogNormWMH', 'NormGM', 'NormWM', 'NormCSF']
         #self.train = self.data.loc[self.data.DiscCohort=='train']
         #self.val = self.data.loc[self.data.DiscCohort=='val']
         #self.test = self.data.loc[self.data.DiscCohort=='test']
@@ -74,13 +74,13 @@ class DatasetADNI:
             y[i,1] = udip_labels.at[ix,'APOE4']
             y[i,2] = udip_labels.at[ix,'DX']
             y[i,3] = udip_labels.at[ix,'Amyloid']
-            #y[i,4] = udip_labels.at[ix,'AdniPhase']
-            y[i,4] = udip_labels.at[ix,'YrsEdu']
-            y[i,5] = udip_labels.at[ix,'Age']
-            y[i,6] = udip_labels.at[ix,'CDRSB']
-            y[i,7] = udip_labels.at[ix,'Centiloids']
-            y[i,8] = udip_labels.at[ix,'NORM_GRAY']
-            y[i,9] = udip_labels.at[ix,'NORM_WMH']
+            y[i,4] = udip_labels.at[ix,'Age']
+            y[i,5] = udip_labels.at[ix,'LogCDRSB']
+            y[i,6] = udip_labels.at[ix,'Centiloids']
+            y[i,7] = udip_labels.at[ix,'LogNormWMH']
+            y[i,8] = udip_labels.at[ix,'NormGM']
+            y[i,9] = udip_labels.at[ix,'NormWM']
+            y[i,10] = udip_labels.at[ix,'NormCSF']
         return y
     
     def get_encoding_data(self, mode):
@@ -101,7 +101,7 @@ class DatasetADNI:
         if self.fmap_size == 256:
             encoding_col = 'UDIP_256'
         elif self.fmap_size == 128:
-            encoding_col = 'UDIP'
+            encoding_col = 'Embedding'
         for i, ix in enumerate(udip_labels.index.values):
             enc = udip_labels.at[ix,encoding_col]
             x[i,:] = np.array(ast.literal_eval(enc))
@@ -111,7 +111,7 @@ class DatasetADNI:
 class PredictiveModel:
     """
     ML models using lower-dimensional latent encoding derived from trained autoencoders.
-    Input is UDIP encodings on discovery cohort. These encodings were generated from a model trained on ADNI dev cohort.
+    Input is encodings on discovery cohort. These encodings were generated from a model trained on ADNI dev cohort.
     """
 
     def __init__(self, fmap_size):
@@ -119,7 +119,7 @@ class PredictiveModel:
         self.label_dir = os.path.join(self.base_dir, 'encodings')
         self.fmap_size = fmap_size
         #self.covars = ['Sex', 'APOE4', 'DX', 'Amyloid', 'AdniPhase', 'YrsEdu', 'Age', 'CDRSB', 'Centiloids']
-        self.covars = ['Sex', 'APOE4', 'DX', 'Amyloid', 'YrsEdu', 'Age', 'CDRSB', 'Centiloids', 'NORM_GRAY', 'NORM_WMH']
+        self.covars = ['Sex', 'APOE4', 'DX', 'Amyloid', 'Age', 'LogCDRSB', 'Centiloids', 'LogNormWMH', 'NormGM', 'NormWM', 'NormCSF']
         #self.covars_continuous = ['YrsEdu', 'Age', 'CDRSB', 'Centiloids']
         #self.covars_categorical = ['Sex', 'APOE4', 'DX', 'Amyloid', 'AdniPhase']
         self.dataset = DatasetADNI(self.fmap_size)
@@ -421,29 +421,29 @@ if __name__=='__main__':
     # run LLE and plot
     x_lin = model.local_lin_embed(n_neighbors=500, n_components=3)
     model.plot_latent_space(x_lin, 'lle_apoe.png', 'LLE and APOE4 (# alleles)', labels=model.labels[:,1])
-    model.plot_latent_space(x_lin, 'lle_cdr.png', 'LE and CDRSB', labels=model.labels[:,6])
-    model.plot_latent_space(x_lin, 'lle_age.png', 'LLE and Age', labels=model.labels[:,5])
+    model.plot_latent_space(x_lin, 'lle_cdr.png', 'LE and LogCDRSB', labels=model.labels[:,5])
+    model.plot_latent_space(x_lin, 'lle_age.png', 'LLE and Age', labels=model.labels[:,4])
     model.plot_latent_space(x_lin, 'lle_sex.png', 'LLE and Sex (1=M, 2=F)', labels=model.labels[:,0])
     model.plot_latent_space(x_lin, 'lle_amyloid.png', 'LLE and Amyloid (0=neg, 1=pos)', labels=model.labels[:,3])
     model.plot_latent_space(x_lin, 'lle_dx.png', 'LLE and Diagnosis (1=CN, 2=MCI, 3=AD)', labels=model.labels[:,2])
-    model.plot_latent_space(x_lin, 'lle_edu.png', 'LLE and Education', labels=model.labels[:,4])
-    #model.plot_latent_space(x_lin, 'lle_adniphase.png', 'LLE and ADNI phase', labels=model.labels[:,4])
-    model.plot_latent_space(x_lin, 'lle_centiloids.png', 'LLE and Centiloid', labels=model.labels[:,7])
-    model.plot_latent_space(x_lin, 'lle_normgray.png', 'LLE and Norm-Gray', labels=model.labels[:,8])
-    model.plot_latent_space(x_lin, 'lle_normwmh.png', 'LLE and Norm-WMH', labels=model.labels[:,9])
+    model.plot_latent_space(x_lin, 'lle_centiloids.png', 'LLE and Centiloid', labels=model.labels[:,6])
+    model.plot_latent_space(x_lin, 'lle_wmh.png', 'LLE and LogNormWMH', labels=model.labels[:,7])
+    model.plot_latent_space(x_lin, 'lle_gm.png', 'LLE and NormGM', labels=model.labels[:,8])
+    model.plot_latent_space(x_lin, 'lle_wm.png', 'LLE and NormWM', labels=model.labels[:,9])
+    model.plot_latent_space(x_lin, 'lle_csf.png', 'LLE and NormCSF', labels=model.labels[:,10])
     
     # run UMAP feature analysis and plot
-    x_reduced = model.run_umap(n_neighbors=100, min_dist=0.2, n_components=2, metric='euclidean')
+    x_reduced = model.run_umap(n_neighbors=500, min_dist=0.1, n_components=3, metric='euclidean')
     model.plot_latent_space(x_reduced, 'umap_apoe.png', 'UMAP and APOE4 (# alleles)', labels=model.labels[:,1])
-    model.plot_latent_space(x_reduced, 'umap_cdr.png', 'UMAP and CDRSB', labels=model.labels[:,6])
-    model.plot_latent_space(x_reduced, 'umap_age.png', 'UMAP and Age', labels=model.labels[:,5])
+    model.plot_latent_space(x_reduced, 'umap_cdr.png', 'UMAP and LogCDRSB', labels=model.labels[:,5])
+    model.plot_latent_space(x_reduced, 'umap_age.png', 'UMAP and Age', labels=model.labels[:,4])
     model.plot_latent_space(x_reduced, 'umap_sex.png', 'UMAP and Sex (1=M, 2=F)', labels=model.labels[:,0])
     model.plot_latent_space(x_reduced, 'umap_amyloid.png', 'UMAP and Amyloid (0=neg, 1=pos)', labels=model.labels[:,3])
     model.plot_latent_space(x_reduced, 'umap_dx.png', 'UMAP and Diagnosis (1=CN, 2=MCI, 3=AD)', labels=model.labels[:,2])
-    model.plot_latent_space(x_reduced, 'umap_edu.png', 'UMAP and Education', labels=model.labels[:,4])
-    #model.plot_latent_space(x_reduced, 'umap_adniphase.png', 'UMAP and ADNI phase', labels=model.labels[:,4])
-    model.plot_latent_space(x_reduced, 'umap_centiloids.png', 'UMAP and Centiloid', labels=model.labels[:,7])
-    model.plot_latent_space(x_reduced, 'umap_normgray.png', 'UMAP and Norm-Gray', labels=model.labels[:,8])
-    model.plot_latent_space(x_reduced, 'umap_normwmh.png', 'UMAP and Norm-WMH', labels=model.labels[:,9])
+    model.plot_latent_space(x_reduced, 'umap_centiloids.png', 'UMAP and Centiloid', labels=model.labels[:,6])
+    model.plot_latent_space(x_reduced, 'umap_wmh.png', 'UMAP and LogNormWMH', labels=model.labels[:,7])
+    model.plot_latent_space(x_reduced, 'umap_gm.png', 'UMAP and NormGM', labels=model.labels[:,8])
+    model.plot_latent_space(x_reduced, 'umap_wm.png', 'UMAP and NormWM', labels=model.labels[:,9])
+    model.plot_latent_space(x_reduced, 'umap_csf.png', 'UMAP and NormCSF', labels=model.labels[:,10])
 
 
